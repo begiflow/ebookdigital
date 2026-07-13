@@ -43,6 +43,11 @@ class BookScene(
     val spreadCount: Int get() = book.sheetCount
     val pageHeightMeters: Float get() = pageH
 
+    /** Key light entity + base aim, for the M9 tilt sway (docs/04 §3). */
+    val keyLightEntity: Int
+    val keyLightDirection: FloatArray
+        get() = floatArrayOf(KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
+
     private val engine = host.engine
     private val transformManager = engine.transformManager
     private val entityManager = EntityManager.get()
@@ -222,7 +227,11 @@ class BookScene(
         setCoverAngle(0f)
 
         // ---- Light rig ----
-        host.addDirectionalLight(1f, 0.98f, 0.94f, 90_000f, 0.45f, -0.75f, -0.5f, castShadows = true)
+        keyLightEntity = host.addDirectionalLight(
+            1f, 0.98f, 0.94f, 90_000f,
+            KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z,
+            castShadows = true,
+        )
         host.setAmbientLight(
             22_000f,
             floatArrayOf(
@@ -634,6 +643,7 @@ class BookScene(
             setParameter("grainTiling", 5f, 7f)
             setParameter("showThrough", paperTuning.translucency)
             setParameter("keyLightDir", KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
+            setParameter("edgeTint", EDGE_TINT)
             Textures.bind(this, "grainNormal", grain)
             // All samplers must be bound; real back textures rebind per page.
             Textures.bind(this, "backColorMap", pageTexture(BLANK_PAGE_INDEX))
@@ -673,6 +683,9 @@ class BookScene(
         const val SKEW_RAMP = 9f
         const val SKEW_DECAY = 4.5f
         const val SKEW_LAMBDA_FLOOR = 0.35f
+
+        // Edge tint (M9, docs/04 §2.1): handled-paper darkening at borders.
+        const val EDGE_TINT = 0.055f
 
         // Flight pool + riffle (M8).
         const val MAX_FLIGHTS = 3

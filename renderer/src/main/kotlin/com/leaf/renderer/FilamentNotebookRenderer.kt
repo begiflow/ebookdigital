@@ -1,5 +1,10 @@
 package com.leaf.renderer
 
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.view.SurfaceView
 import com.leaf.filament.FilamentHost
 import com.leaf.physics.CoverHinge
@@ -33,6 +38,19 @@ class FilamentNotebookRenderer : NotebookRenderer {
     private val raycaster = Raycaster(FilamentHost.VERTICAL_FOV_DEGREES.toFloat())
     private val rifflePacer = RifflePacer()
 
+    // M9 key sway: gravity sensor tilt leans the key light ~1° so paper
+    // grain shimmers as the reader moves (docs/04-GRAPHICS-PIPELINE.md §3).
+    private var keySway: KeySway? = null
+    private var keySwayEnabled = true
+    private var sensorManager: SensorManager? = null
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            keySway?.setTilt(event.values[0], event.values[1], event.values[2])
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
+
     private var lastFrameNanos = 0L
     private var simAccumulator = 0f
 
@@ -57,6 +75,12 @@ class FilamentNotebookRenderer : NotebookRenderer {
         check(host == null) { "already attached" }
         this.surfaceView = surfaceView
         feedback = FeelFeedback(surfaceView.context)
+        sensorManager =
+            (surfaceView.context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager)?.also { sm ->
+                val gravity = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+                    ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+                gravity?.let { sm.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME) }
+            }
         host = FilamentHost(surfaceView).also {
             it.frameListener = ::frame
             it.resume()
@@ -64,6 +88,8 @@ class FilamentNotebookRenderer : NotebookRenderer {
     }
 
     override fun detach() {
+        sensorManager?.unregisterListener(sensorListener)
+        sensorManager = null
         scene?.destroy()
         scene = null
         host?.destroy()
@@ -82,6 +108,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
         val newScene = BookScene(host, book, assets)
         newScene.onFeel = { event -> feedback?.on(event) }
         scene = newScene
+        keySway = newScene.keyLightDirection.let { KeySway(it[0], it[1], it[2]) }
         hinge = CoverHinge(
             openRestAngle = newScene.coverOpenRestAngle,
             maxAngle = newScene.coverOpenRestAngle + 0.06f,
@@ -260,6 +287,16 @@ class FilamentNotebookRenderer : NotebookRenderer {
 
     fun paperTuning(): PaperTuning? = scene?.paperTuning
 
+    /** M9: toggle the tilt-driven key sway (docs/04 §3 — optional by design). */
+    fun setKeySwayEnabled(enabled: Boolean) {
+        keySwayEnabled = enabled
+        if (!enabled) {
+            val s = scene ?: return
+            val base = s.keyLightDirection
+            host?.setLightDirection(s.keyLightEntity, base[0], base[1], base[2])
+        }
+    }
+
     private fun dragPage(gesture: GestureEvent.Move, width: Float, height: Float) {
         val scene = scene ?: return
         val rig = rig ?: return
@@ -345,6 +382,16 @@ class FilamentNotebookRenderer : NotebookRenderer {
 
             if (scene != null && scene.isTurning) scene.updateFlightMesh()
             publishState(h)
+        }
+
+        // Key sway (M9): lean the key light with device tilt.
+        if (keySwayEnabled) {
+            val sway = keySway
+            val s = scene
+            if (sway != null && s != null) {
+                val dir = sway.update(dt)
+                host.setLightDirection(s.keyLightEntity, dir[0], dir[1], dir[2])
+            }
         }
 
         rig?.let {

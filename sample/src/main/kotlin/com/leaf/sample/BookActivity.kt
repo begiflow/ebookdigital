@@ -177,6 +177,18 @@ class BookActivity : Activity() {
         }
         panel.addView(presets)
 
+        var swayOn = true
+        panel.addView(
+            Button(this).apply {
+                text = "key sway: on"
+                setOnClickListener {
+                    swayOn = !swayOn
+                    renderer.setKeySwayEnabled(swayOn)
+                    text = if (swayOn) "key sway: on" else "key sway: off"
+                }
+            },
+        )
+
         panel.addView(
             Button(this).apply {
                 text = "export json"

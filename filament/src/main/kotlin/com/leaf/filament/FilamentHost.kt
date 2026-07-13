@@ -5,6 +5,7 @@ import android.view.Choreographer
 import android.view.Surface
 import android.view.SurfaceView
 import com.google.android.filament.Camera
+import com.google.android.filament.ColorGrading
 import com.google.android.filament.Engine
 import com.google.android.filament.EntityManager
 import com.google.android.filament.Filament
@@ -14,6 +15,7 @@ import com.google.android.filament.Material
 import com.google.android.filament.Renderer
 import com.google.android.filament.Scene
 import com.google.android.filament.SwapChain
+import com.google.android.filament.ToneMapper
 import com.google.android.filament.View
 import com.google.android.filament.Viewport
 import com.google.android.filament.android.DisplayHelper
@@ -49,6 +51,13 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     private var swapChain: SwapChain? = null
     private var running = false
 
+    // Neutral color pipeline (docs/04-GRAPHICS-PIPELINE.md §5): linear tone
+    // mapping, no grading — scanned paper white must stay paper white. This
+    // is a scanner-fidelity product; punchy ACES defaults would falsify color.
+    private val colorGrading: ColorGrading = ColorGrading.Builder()
+        .toneMapper(ToneMapper.Linear())
+        .build(engine)
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!running) return
@@ -72,6 +81,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     init {
         view.scene = scene
         view.camera = camera
+        view.colorGrading = colorGrading
 
         uiHelper.renderCallback = object : UiHelper.RendererCallback {
             override fun onNativeWindowChanged(surface: Surface) {
@@ -125,6 +135,12 @@ class FilamentHost(private val surfaceView: SurfaceView) {
         return entity
     }
 
+    /** Re-aims a light created by [addDirectionalLight] (M9 key sway). */
+    fun setLightDirection(entity: Int, x: Float, y: Float, z: Float) {
+        val lm = engine.lightManager
+        lm.setDirection(lm.getInstance(entity), x, y, z)
+    }
+
     /**
      * Sets ambient irradiance from spherical harmonics (3 bands, 27 floats,
      * RGB-interleaved). Hand-tuned SH stands in until the real IBL asset
@@ -160,6 +176,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     fun destroy() {
         pause()
         uiHelper.detach()
+        engine.destroyColorGrading(colorGrading)
         engine.destroyRenderer(renderer)
         engine.destroyView(view)
         engine.destroyScene(scene)
