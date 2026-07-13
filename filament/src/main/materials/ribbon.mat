@@ -1,0 +1,22 @@
+// M2 dynamic-mesh material: minimal lit surface. Evolves into paper.mat at M5
+// (scan baseColor texture, grain normals, show-through — docs/04 §2.1).
+// Recompile: tools/filament/bin/matc -p mobile -a opengl -a vulkan \
+//   -o filament/src/main/assets/materials/ribbon.filamat filament/src/main/materials/ribbon.mat
+material {
+    name : Ribbon,
+    shadingModel : lit,
+    doubleSided : true,
+    parameters : [
+        { type : float3, name : baseColor },
+        { type : float, name : roughness }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor.rgb = materialParams.baseColor;
+        material.roughness = materialParams.roughness;
+        material.metallic = 0.0;
+    }
+}

@@ -1,0 +1,23 @@
+// Cover/spine material: captured (or generated) cover as baseColor.
+// CoverType variants (clearCoat for laminate/polycarbonate) arrive with M5+
+// per docs/04-GRAPHICS-PIPELINE.md §2.2.
+// Recompile: tools/filament/bin/matc -p mobile -a opengl -a vulkan \
+//   -o filament/src/main/assets/materials/cover.filamat filament/src/main/materials/cover.mat
+material {
+    name : Cover,
+    shadingModel : lit,
+    requires : [ uv0 ],
+    parameters : [
+        { type : sampler2d, name : baseColorMap },
+        { type : float, name : roughness }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor = texture(materialParams_baseColorMap, getUV0());
+        material.roughness = materialParams.roughness;
+        material.metallic = 0.0;
+    }
+}

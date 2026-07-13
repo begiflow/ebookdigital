@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:label="LEAF Sample"
+        android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+
+        <!-- Lets :benchmark capture LeafFrame trace sections on release builds. -->
+        <profileable android:shell="true" />
+
+        <!-- M3+: closed-book inspection demo. -->
+        <activity
+            android:name=".BookActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- M2 streaming workload; kept as the benchmark's stress target. -->
+        <activity
+            android:name=".RibbonActivity"
+            android:exported="true" />
+    </application>
+
+</manifest>
