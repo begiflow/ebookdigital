@@ -6,10 +6,11 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
- * Procedural paper-grain normal map: anisotropically blurred noise (laid
- * paper's horizontal fiber bias) converted to a tangent-space normal map.
- * Generated once at startup; per-GrainKind variants (woven, gloss) join in M7
- * (docs/04-GRAPHICS-PIPELINE.md §2.1).
+ * Procedural paper-grain normal maps, one per GrainKind
+ * (docs/04-GRAPHICS-PIPELINE.md §2.1). Generated once at startup:
+ * - laid: horizontal fiber bias (anisotropic blur along x),
+ * - woven: isotropic felt — even blur both ways,
+ * - gloss: calendered stock — heavily smoothed, shallow relief.
  */
 object PaperGrain {
 
@@ -21,6 +22,32 @@ object PaperGrain {
         repeat(3) { height = blurX(height, size) }
         height = blurY(height, size)
 
+        return toNormalMap(height, size, strength)
+    }
+
+    fun wovenNormalMap(size: Int = 256, seed: Long = 11L, strength: Float = 1.3f): Bitmap {
+        val random = Random(seed)
+        var height = FloatArray(size * size) { random.nextFloat() }
+
+        repeat(2) {
+            height = blurX(height, size)
+            height = blurY(height, size)
+        }
+        return toNormalMap(height, size, strength)
+    }
+
+    fun glossNormalMap(size: Int = 256, seed: Long = 13L, strength: Float = 0.5f): Bitmap {
+        val random = Random(seed)
+        var height = FloatArray(size * size) { random.nextFloat() }
+
+        repeat(4) {
+            height = blurX(height, size)
+            height = blurY(height, size)
+        }
+        return toNormalMap(height, size, strength)
+    }
+
+    private fun toNormalMap(height: FloatArray, size: Int, strength: Float): Bitmap {
         val pixels = IntArray(size * size)
         for (y in 0 until size) {
             for (x in 0 until size) {

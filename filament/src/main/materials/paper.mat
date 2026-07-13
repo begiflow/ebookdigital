@@ -1,6 +1,8 @@
-// Paper material v1 (docs/04-GRAPHICS-PIPELINE.md §2.1): scanned page as
-// baseColor + tiled grain normal map + high roughness. Show-through and
-// per-GrainKind variants arrive in M7.
+// Paper material v2 (docs/04-GRAPHICS-PIPELINE.md §2.1): scanned page as
+// baseColor + tiled grain normal map + high roughness, plus M7 show-through —
+// a faint, blurred, horizontally mirrored sample of the sheet's other side,
+// weighted by profile translucency and strongest when the key light is behind
+// the page relative to the camera (cheap wrap term).
 // Recompile: tools/filament/bin/matc -p mobile -a opengl -a vulkan \
 //   -o filament/src/main/assets/materials/paper.filamat filament/src/main/materials/paper.mat
 material {
@@ -9,19 +11,33 @@ material {
     requires : [ uv0 ],
     parameters : [
         { type : sampler2d, name : baseColorMap },
+        { type : sampler2d, name : backColorMap },
         { type : sampler2d, name : grainNormal },
         { type : float, name : roughness },
         { type : float, name : grainStrength },
-        { type : float2, name : grainTiling }
+        { type : float2, name : grainTiling },
+        { type : float, name : showThrough },
+        { type : float3, name : keyLightDir }
     ]
 }
 
 fragment {
     void material(inout MaterialInputs material) {
-        vec3 grain = texture(materialParams_grainNormal, getUV0() * materialParams.grainTiling).xyz * 2.0 - 1.0;
+        vec2 uv = getUV0();
+        vec3 grain = texture(materialParams_grainNormal, uv * materialParams.grainTiling).xyz * 2.0 - 1.0;
         material.normal = normalize(mix(vec3(0.0, 0.0, 1.0), grain, materialParams.grainStrength));
         prepareMaterial(material);
-        material.baseColor = texture(materialParams_baseColorMap, getUV0());
+
+        vec4 base = texture(materialParams_baseColorMap, uv);
+
+        // Show-through: mirrored u (ink seen from the wrong side), fixed high
+        // LOD as the blur (one extra sample), multiplicative — ink darkens.
+        vec3 back = textureLod(materialParams_backColorMap, vec2(1.0 - uv.x, uv.y), 3.0).rgb;
+        float behind = saturate(dot(getWorldGeometricNormalVector(), materialParams.keyLightDir));
+        float bleed = materialParams.showThrough * (0.35 + 0.65 * behind);
+        base.rgb *= mix(vec3(1.0), back, bleed);
+
+        material.baseColor = base;
         material.roughness = materialParams.roughness;
         material.metallic = 0.0;
     }

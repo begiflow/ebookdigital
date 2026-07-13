@@ -11,4 +11,7 @@ dependencies {
     implementation(project(":physics"))
     implementation(project(":filament"))
     implementation(libs.kotlinx.coroutines.android)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.kotlin.test)
 }

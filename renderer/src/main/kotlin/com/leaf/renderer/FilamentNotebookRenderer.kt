@@ -178,7 +178,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
         raycaster.hitPlaneZ(dir, scene.rightPageWorldZ())?.let { hit ->
             if (scene.pageRectContains(hit.x, hit.y, rightSide = true)) {
                 val u = (scene.worldToSimX(hit.x) / loadedPageWidth()).coerceIn(0.05f, 1f)
-                if (scene.beginTurn(forward = true, u = u)) {
+                if (scene.beginTurn(forward = true, u = u, v = grabRowFraction(hit.y))) {
                     grabPlaneY = hit.y
                     resetFlickTracking(gesture.timeMillis, scene.worldToSimX(hit.x))
                     return true
@@ -189,7 +189,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
         raycaster.hitPlaneZ(dir, scene.leftPageWorldZ())?.let { hit ->
             if (scene.pageRectContains(hit.x, hit.y, rightSide = false)) {
                 val u = (-scene.worldToSimX(hit.x) / loadedPageWidth()).coerceIn(0.05f, 1f)
-                if (scene.beginTurn(forward = false, u = u)) {
+                if (scene.beginTurn(forward = false, u = u, v = grabRowFraction(hit.y))) {
                     grabPlaneY = hit.y
                     resetFlickTracking(gesture.timeMillis, scene.worldToSimX(hit.x))
                     return true
@@ -198,6 +198,19 @@ class FilamentNotebookRenderer : NotebookRenderer {
         }
         return false
     }
+
+    /** World y on the page -> row fraction (0 bottom, 1 top) for corner skew. */
+    private fun grabRowFraction(worldY: Float): Float {
+        val h = scene?.pageHeightMeters ?: return 0.5f
+        return (worldY / h + 0.5f).coerceIn(0f, 1f)
+    }
+
+    /** M7 tuning harness hook: live paper feel (docs/05-PHYSICS.md §6). */
+    fun setPaperTuning(tuning: PaperTuning) {
+        scene?.setPaperTuning(tuning)
+    }
+
+    fun paperTuning(): PaperTuning? = scene?.paperTuning
 
     private fun dragPage(gesture: GestureEvent.Move, width: Float, height: Float) {
         val scene = scene ?: return

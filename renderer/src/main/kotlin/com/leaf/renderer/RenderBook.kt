@@ -26,6 +26,10 @@ data class RenderBook(
     val pageBitmapProvider: ((pageIndex: Int) -> Bitmap)? = null,
     /** 0 = floppy diary paper, 1 = passport card stock (PageParams.stiffness). */
     val paperStiffness: Float = 0.5f,
+    /** 0..1 show-through weight (PaperSpec.translucency): thin diary paper ~0.4, card stock ~0. */
+    val paperTranslucency: Float = 0.25f,
+    /** Paper grain family; selects the procedural grain normal map + roughness. */
+    val grain: RenderGrain = RenderGrain.LAID,
 ) {
     val blockThicknessMeters: Float = sheetCount * sheetThicknessMeters
     val totalThicknessMeters: Float = blockThicknessMeters + 2f * coverThicknessMeters
@@ -54,4 +58,32 @@ enum class RenderBinding {
     STAPLED,
     SPIRAL,
     GLUED,
+}
+
+/** Renderer-side grain selector; maps 1:1 from domain GrainKind (docs/04 §2.1). */
+enum class RenderGrain {
+    LAID,
+    WOVEN,
+    GLOSS,
+}
+
+/**
+ * Live paper-feel parameters (M7 tuning harness, docs/05-PHYSICS.md §6).
+ * Applied to the next page grab — physics params are per-strip — except
+ * [translucency], which updates the paper material immediately.
+ */
+data class PaperTuning(
+    val stiffness: Float,
+    val damping: Float,
+    val airDrag: Float,
+    val translucency: Float,
+) {
+    companion object {
+        fun fromBook(book: RenderBook) = PaperTuning(
+            stiffness = book.paperStiffness,
+            damping = 2.8f,
+            airDrag = 12f,
+            translucency = book.paperTranslucency,
+        )
+    }
 }

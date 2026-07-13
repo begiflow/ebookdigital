@@ -125,8 +125,13 @@ class PageStrip(val params: PageParams) {
             if (grabbedIndex < 0 && settle == Settle.IN_FLIGHT) {
                 vx[i] += bias * BIAS_ACCEL * h
             }
-            vx[i] *= dampingFactor
-            vz[i] *= dampingFactor
+            // Air drag ∝ -v·|v| (docs/05 §2), integrated implicitly so it can
+            // never reverse a velocity: v/(1 + k|v|h). This is the flutter
+            // brake — a released page slows into its fall instead of whipping.
+            val speed = sqrt(vx[i] * vx[i] + vz[i] * vz[i])
+            val drag = 1f / (1f + params.airDrag * speed * h)
+            vx[i] *= dampingFactor * drag
+            vz[i] *= dampingFactor * drag
             prevX[i] = px[i]
             prevZ[i] = pz[i]
             px[i] += vx[i] * h
@@ -262,6 +267,9 @@ class PageParams(
     val particleCount: Int = 16,
     /** 0 = floppy diary paper, 1 = passport card stock. */
     val stiffness: Float = 0.5f,
+    /** Linear velocity damping (internal friction), 1/s. */
     val damping: Float = 2.8f,
+    /** Quadratic air drag coefficient, 1/m — the flutter-settle knob. */
+    val airDrag: Float = 12f,
     val gravity: Float = -9.81f,
 )
