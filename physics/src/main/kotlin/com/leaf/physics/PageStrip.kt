@@ -101,14 +101,38 @@ class PageStrip(val params: PageParams) {
 
     /**
      * [directionHint] from flick velocity: -1 finish left, +1 fall back
-     * right, 0 = decide from the free edge's lean.
+     * right, 0 = decide from momentum + lean (docs/05 §3): if the outer
+     * third of the page carries clear sideways speed, it wins; otherwise
+     * the free edge's lean does.
      */
     fun release(directionHint: Int) {
         if (grabbedIndex < 0) return
         grabbedIndex = -1
         bias = when {
             directionHint != 0 -> directionHint.toFloat()
-            else -> if (px[n - 1] < 0f) -1f else 1f
+            else -> {
+                var meanVx = 0f
+                val outer = n - n / 3
+                for (i in outer until n) meanVx += vx[i]
+                meanVx /= (n - outer)
+                when {
+                    meanVx < -RELEASE_MOMENTUM -> -1f
+                    meanVx > RELEASE_MOMENTUM -> 1f
+                    else -> if (px[n - 1] < 0f) -1f else 1f
+                }
+            }
+        }
+    }
+
+    /**
+     * Kicks the free edge (riffle: the thumb flicks the page without holding
+     * it). Velocity ramps from the pivot to the tip like a real edge strike.
+     */
+    fun fling(speedX: Float, lift: Float) {
+        for (i in 1 until n) {
+            val s = i / (n - 1f)
+            vx[i] += speedX * s
+            vz[i] += lift * s
         }
     }
 
@@ -122,7 +146,12 @@ class PageStrip(val params: PageParams) {
         val dampingFactor = exp(-params.damping * h)
         for (i in 1 until n) {
             vz[i] += params.gravity * h
-            if (grabbedIndex < 0 && settle == Settle.IN_FLIGHT) {
+            // Turn-completion torque acts on airborne paper only: once a
+            // particle rests on the stack the bias lets go, so a landed page
+            // stops being pushed sideways and can actually settle (M8).
+            if (grabbedIndex < 0 && settle == Settle.IN_FLIGHT &&
+                pz[i] - surface(px[i]) > BIAS_LIFT_EPS
+            ) {
                 vx[i] += bias * BIAS_ACCEL * h
             }
             // Air drag ∝ -v·|v| (docs/05 §2), integrated implicitly so it can
@@ -254,6 +283,8 @@ class PageStrip(val params: PageParams) {
         const val BIAS_ACCEL = 26f
         const val SETTLE_SPEED = 0.03f
         const val SETTLE_LIFT = 0.006f
+        const val RELEASE_MOMENTUM = 0.18f
+        const val BIAS_LIFT_EPS = 0.0015f
         const val MIN_DRAG_LIFT = 0.002f
         const val REST_EPS = 0.0002f
         const val PIVOT_Z = 0.0008f
