@@ -13,11 +13,15 @@ import com.leaf.filament.StaticMesh
 import com.leaf.filament.Textures
 import com.leaf.physics.PageParams
 import com.leaf.physics.PageStrip
+import com.leaf.renderer.PaperTuning
 import com.leaf.renderer.RenderBook
+import com.leaf.renderer.RenderGrain
 import com.leaf.renderer.geometry.BookGeometry
 import com.leaf.renderer.material.PaperGrain
 import kotlin.math.PI
 import kotlin.math.atan
+import kotlin.math.atan2
+import kotlin.math.sqrt
 import kotlin.math.tan
 
 /**
@@ -36,6 +40,7 @@ class BookScene(
         private set
 
     val spreadCount: Int get() = book.sheetCount
+    val pageHeightMeters: Float get() = pageH
 
     private val engine = host.engine
     private val transformManager = engine.transformManager
@@ -72,6 +77,15 @@ class BookScene(
     private var turnForward = true
     val isTurning: Boolean get() = flight != null
     val turnDirectionForward: Boolean get() = turnForward
+
+    // ---- Corner-skew state (M7, docs/05-PHYSICS.md §4) ----
+    private var grabV = 0.5f
+    private var skewStrength = 0f
+    private var turnRestAngle = 0f
+
+    /** Live paper feel; physics params apply from the next grab. */
+    var paperTuning: PaperTuning = PaperTuning.fromBook(book)
+        private set
 
     // Geometry constants derived from the book.
     private val w = book.widthMeters
@@ -133,7 +147,15 @@ class BookScene(
             setParameter("roughness", 0.96f)
         }
 
-        grainTexture = Textures.fromBitmap(engine, PaperGrain.laidNormalMap(), srgb = false)
+        grainTexture = Textures.fromBitmap(
+            engine,
+            when (book.grain) {
+                RenderGrain.LAID -> PaperGrain.laidNormalMap()
+                RenderGrain.WOVEN -> PaperGrain.wovenNormalMap()
+                RenderGrain.GLOSS -> PaperGrain.glossNormalMap()
+            },
+            srgb = false,
+        )
         leftPaperInstance = newPaperInstance(paperMaterial, grainTexture)
         rightPaperInstance = newPaperInstance(paperMaterial, grainTexture)
 
@@ -232,9 +254,10 @@ class BookScene(
 
     /**
      * Starts turning the top sheet of a side. [u] = grab fraction along the
-     * width from the spine. Returns false at the ends of the book.
+     * width from the spine, [v] = grab fraction along the height (0 = bottom
+     * edge; drives the corner skew). Returns false at the ends of the book.
      */
-    fun beginTurn(forward: Boolean, u: Float): Boolean {
+    fun beginTurn(forward: Boolean, u: Float, v: Float = 0.5f): Boolean {
         if (isTurning) return false
         if (forward && spread >= spreadCount) return false
         if (!forward && spread <= 0) return false
@@ -250,7 +273,12 @@ class BookScene(
         )
 
         val s = PageStrip(
-            PageParams(widthMeters = pageW, stiffness = book.paperStiffness),
+            PageParams(
+                widthMeters = pageW,
+                stiffness = paperTuning.stiffness,
+                damping = paperTuning.damping,
+                airDrag = paperTuning.airDrag,
+            ),
         )
         s.setSurfaces(
             left = leftSpineTopSim(if (forward) spread else spread - 1),
@@ -261,11 +289,20 @@ class BookScene(
         s.grab(u)
         strip = s
 
+        grabV = v.coerceIn(0f, 1f)
+        skewStrength = 0f
+        // Rest direction of the source side: flat right, or down the opened
+        // cover's slope for backward turns.
+        turnRestAngle = if (forward) 0f else atan2(leftSlope, -1f)
+
         // Flight faces: sheet front / back, mapped per the domain sheet model.
+        // Each face also carries the *other* side's texture for show-through.
         val frontInstance = newPaperInstance(paperMaterial, grainTexture)
         val backInstance = newPaperInstance(paperMaterial, grainTexture)
         Textures.bind(frontInstance, "baseColorMap", pageTexture(2 * sheet))
+        Textures.bind(frontInstance, "backColorMap", pageTexture(2 * sheet + 1))
         Textures.bind(backInstance, "baseColorMap", pageTexture(2 * sheet + 1))
+        Textures.bind(backInstance, "backColorMap", pageTexture(2 * sheet))
         flightInstances.add(frontInstance)
         flightInstances.add(backInstance)
 
@@ -295,14 +332,41 @@ class BookScene(
         s.grab(best / (s.n - 1f))
     }
 
-    fun stepTurn(dt: Float) = strip?.step(dt)
+    fun stepTurn(dt: Float) {
+        val s = strip ?: return
+        s.step(dt)
+        // Skew ramps in while the finger holds the page and evens out after
+        // release — a settled page must be skew-free before it rejoins a stack.
+        skewStrength = if (s.isGrabbed) {
+            (skewStrength + dt * SKEW_RAMP).coerceAtMost(1f)
+        } else {
+            (skewStrength - dt * SKEW_DECAY).coerceAtLeast(0f)
+        }
+    }
 
     fun turnSettle(): PageStrip.Settle = strip?.settle ?: PageStrip.Settle.IN_FLIGHT
 
     /** Extrudes the current strip state into the flight meshes (once/frame). */
     fun updateFlightMesh() {
         val s = strip ?: return
-        flight?.update(s, spineX, backInnerZ, pageH)
+        // λ(stiffness): how much of the curl the far edge keeps. Card stock
+        // (stiffness 1) lifts as a plate — zero skew.
+        val lambda = SKEW_LAMBDA_FLOOR + (1f - SKEW_LAMBDA_FLOOR) * paperTuning.stiffness
+        flight?.update(
+            s, spineX, backInnerZ, pageH,
+            grabV = grabV,
+            skew = skewStrength * (1f - lambda),
+            restAngle = turnRestAngle,
+        )
+    }
+
+    /** Applies live paper-feel tuning; physics params take effect on the next grab. */
+    fun setPaperTuning(tuning: PaperTuning) {
+        paperTuning = tuning
+        val show = tuning.translucency
+        leftPaperInstance.setParameter("showThrough", show)
+        rightPaperInstance.setParameter("showThrough", show)
+        flightInstances.forEach { it.setParameter("showThrough", show) }
     }
 
     /** Ends the turn: advances the spread by where the sheet landed. */
@@ -424,6 +488,8 @@ class BookScene(
                 spineU = 1f,
             )
             Textures.bind(leftPaperInstance, "baseColorMap", pageTexture(leftPageIndex!!))
+            // Other side of the same sheet, for show-through (docs/04 §2.1).
+            Textures.bind(leftPaperInstance, "backColorMap", pageTexture(leftPageIndex - 1))
         }
         if (showLeft != leftPageVisible) {
             if (showLeft) host.scene.addEntity(leftPage.entity) else host.scene.removeEntity(leftPage.entity)
@@ -441,6 +507,7 @@ class BookScene(
                 spineU = 0f,
             )
             Textures.bind(rightPaperInstance, "baseColorMap", pageTexture(rightPageIndex!!))
+            Textures.bind(rightPaperInstance, "backColorMap", pageTexture(rightPageIndex + 1))
         }
         if (showRight != rightPageVisible) {
             if (showRight) host.scene.addEntity(rightPage.entity) else host.scene.removeEntity(rightPage.entity)
@@ -449,16 +516,36 @@ class BookScene(
     }
 
     private fun pageTexture(pageIndex: Int): Texture = pageTextures.getOrPut(pageIndex) {
-        val bitmap = book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+        val bitmap = if (pageIndex == BLANK_PAGE_INDEX) {
+            blankPage
+        } else {
+            book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+        }
         Textures.fromBitmap(engine, bitmap)
     }
 
     private fun newPaperInstance(material: com.google.android.filament.Material, grain: Texture) =
         material.createInstance().apply {
-            setParameter("roughness", 0.88f)
-            setParameter("grainStrength", 0.45f)
+            when (book.grain) {
+                RenderGrain.LAID -> {
+                    setParameter("roughness", 0.88f)
+                    setParameter("grainStrength", 0.45f)
+                }
+                RenderGrain.WOVEN -> {
+                    setParameter("roughness", 0.84f)
+                    setParameter("grainStrength", 0.38f)
+                }
+                RenderGrain.GLOSS -> {
+                    setParameter("roughness", 0.62f)
+                    setParameter("grainStrength", 0.18f)
+                }
+            }
             setParameter("grainTiling", 5f, 7f)
+            setParameter("showThrough", paperTuning.translucency)
+            setParameter("keyLightDir", KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
             Textures.bind(this, "grainNormal", grain)
+            // All samplers must be bound; real back textures rebind per page.
+            Textures.bind(this, "backColorMap", pageTexture(BLANK_PAGE_INDEX))
         }
 
     private fun addStatic(
@@ -489,5 +576,20 @@ class BookScene(
         const val DESK_W = 0.85f
         const val DESK_H = 1.2f
         val IDENTITY = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+
+        // Corner skew (M7): ramp-in/fade-out rates (1/s) and the floppiest
+        // paper's far-edge weight floor.
+        const val SKEW_RAMP = 9f
+        const val SKEW_DECAY = 4.5f
+        const val SKEW_LAMBDA_FLOOR = 0.35f
+
+        // Must match the addDirectionalLight() rig below (normalized).
+        val KEY_LIGHT_LEN = sqrt(0.45f * 0.45f + 0.75f * 0.75f + 0.5f * 0.5f)
+        val KEY_LIGHT_X = 0.45f / KEY_LIGHT_LEN
+        val KEY_LIGHT_Y = -0.75f / KEY_LIGHT_LEN
+        val KEY_LIGHT_Z = -0.5f / KEY_LIGHT_LEN
+
+        /** pageTexture key for the blank fallback (never hits the provider). */
+        const val BLANK_PAGE_INDEX = -1
     }
 }

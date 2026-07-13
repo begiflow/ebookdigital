@@ -117,6 +117,31 @@ class PageStripTest {
     }
 
     @Test
+    fun `air drag brakes the fall of a released page`() {
+        fun fallAfter(airDrag: Float, steps: Int): Float {
+            val strip = PageStrip(
+                PageParams(widthMeters = 0.14f, stiffness = 0.5f, damping = 0f, airDrag = airDrag),
+            ).apply {
+                setSurfaces(left = 0.004f, right = 0.008f, slopeLeft = 0.19f)
+                resetFlat(onRight = true, bowHeight = 0.0035f)
+            }
+            strip.grab(0.9f)
+            repeat(240) { strip.drag(0.02f, 0.12f); strip.step(dt) }
+            val tip = strip.n - 1
+            val z0 = strip.pz[tip]
+            strip.release(directionHint = 1)
+            repeat(steps) { strip.step(dt) }
+            return z0 - strip.pz[tip]
+        }
+        val draggy = fallAfter(airDrag = 40f, steps = 20)
+        val vacuum = fallAfter(airDrag = 0f, steps = 20)
+        assertTrue(
+            draggy < vacuum * 0.85f,
+            "air drag should slow the drop: draggy=$draggy vacuum=$vacuum",
+        )
+    }
+
+    @Test
     fun `deterministic across runs`() {
         fun run(): Pair<Float, Float> {
             val strip = newStrip()
