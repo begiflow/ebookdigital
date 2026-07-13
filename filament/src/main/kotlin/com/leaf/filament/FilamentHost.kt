@@ -38,6 +38,16 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     /** Called every frame before rendering; receives the frame time in nanos. */
     var frameListener: ((frameTimeNanos: Long) -> Unit)? = null
 
+    /**
+     * Frame cap (M10 degradation ladder, docs/02 §7): when > 0, render
+     * submission is skipped until this much time has passed since the last
+     * rendered frame. The frame listener still runs every vsync — physics
+     * keeps its fixed 120 Hz feel; only presentation degrades.
+     */
+    var minFramePeriodNanos: Long = 0L
+
+    private var lastRenderNanos = 0L
+
     val engine: Engine = Engine.create()
     val scene: Scene = engine.createScene()
     val view: View = engine.createView()
@@ -68,9 +78,15 @@ class FilamentHost(private val surfaceView: SurfaceView) {
             try {
                 frameListener?.invoke(frameTimeNanos)
                 val sc = swapChain ?: return
+                if (minFramePeriodNanos > 0L &&
+                    frameTimeNanos - lastRenderNanos < minFramePeriodNanos * 9 / 10
+                ) {
+                    return
+                }
                 if (uiHelper.isReadyToRender && renderer.beginFrame(sc, frameTimeNanos)) {
                     renderer.render(view)
                     renderer.endFrame()
+                    lastRenderNanos = frameTimeNanos
                 }
             } finally {
                 Trace.endSection()
@@ -123,6 +139,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
         intensityLux: Float,
         dirX: Float, dirY: Float, dirZ: Float,
         castShadows: Boolean = false,
+        shadowOptions: LightManager.ShadowOptions? = null,
     ): Int {
         val entity = EntityManager.get().create()
         LightManager.Builder(LightManager.Type.DIRECTIONAL)
@@ -130,9 +147,18 @@ class FilamentHost(private val surfaceView: SurfaceView) {
             .intensity(intensityLux)
             .direction(dirX, dirY, dirZ)
             .castShadows(castShadows)
+            .apply { shadowOptions?.let { shadowOptions(it) } }
             .build(engine, entity)
         scene.addEntity(entity)
         return entity
+    }
+
+    /** Removes and destroys a light entity created by [addDirectionalLight]. */
+    fun removeLight(entity: Int) {
+        scene.removeEntity(entity)
+        engine.lightManager.destroy(entity)
+        engine.destroyEntity(entity)
+        EntityManager.get().destroy(entity)
     }
 
     /** Re-aims a light created by [addDirectionalLight] (M9 key sway). */

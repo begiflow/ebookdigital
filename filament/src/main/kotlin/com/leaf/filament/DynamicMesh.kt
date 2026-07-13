@@ -26,6 +26,16 @@ class DynamicMesh(
     materialInstance: MaterialInstance,
     /** Flip triangle winding for meshes whose visible face is -Z (left pages). */
     flipWinding: Boolean = false,
+    /** Shadow flags (M10): in-flight pages are casters + receivers. */
+    castShadows: Boolean = false,
+    receiveShadows: Boolean = false,
+    /**
+     * Static local-space bounds. Culling stays off, but directional shadow
+     * maps fit their frustum to caster bounds — callers whose mesh casts
+     * shadows should pass a tight box (docs/04 §3: tight ortho bounds around
+     * the book are what buy shadow resolution).
+     */
+    boundingBox: Box = Box(0f, 0f, 0f, 4f, 4f, 4f),
 ) {
     init {
         require(cols >= 2 && rows >= 2) { "grid needs at least 2x2 vertices" }
@@ -87,14 +97,14 @@ class DynamicMesh(
         indexBuffer.setBuffer(engine, ShortBuffer.wrap(indices))
 
         RenderableManager.Builder(1)
-            // Generous static bounds: deformation stays well inside; per-frame
-            // bound recomputation is not worth the cost (culling disabled anyway
+            // Static bounds: deformation stays inside; per-frame bound
+            // recomputation is not worth the cost (culling disabled anyway
             // — a page is essentially always on screen).
-            .boundingBox(Box(0f, 0f, 0f, 4f, 4f, 4f))
+            .boundingBox(boundingBox)
             .geometry(0, RenderableManager.PrimitiveType.TRIANGLES, vertexBuffer, indexBuffer)
             .material(0, materialInstance)
-            .castShadows(false)
-            .receiveShadows(false)
+            .castShadows(castShadows)
+            .receiveShadows(receiveShadows)
             .culling(false)
             .build(engine, entity)
     }

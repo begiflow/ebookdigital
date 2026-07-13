@@ -4,6 +4,9 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -40,6 +43,8 @@ class BookActivity : Activity() {
 
     private var tuning = BOOKLET
 
+    private val autoPilot = Handler(Looper.getMainLooper())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         surfaceView = SurfaceView(this)
@@ -67,6 +72,13 @@ class BookActivity : Activity() {
         root.addView(surfaceView)
         root.addView(buildTuningOverlay())
         setContentView(root)
+
+        // Benchmark autopilot (M10): opens the cover, then turns pages in a
+        // loop — drives the hero-shadow workload with zero human input so
+        // TurnFrameBenchmark measures shadowed turning, not an idle spread.
+        if (intent.getBooleanExtra(EXTRA_AUTOPLAY, false)) {
+            autoPilot.postDelayed({ autoOpenCover() }, 1_500L)
+        }
 
         scaleDetector = ScaleGestureDetector(
             this,
@@ -103,8 +115,68 @@ class BookActivity : Activity() {
     }
 
     override fun onDestroy() {
+        autoPilot.removeCallbacksAndMessages(null)
         renderer.detach()
         super.onDestroy()
+    }
+
+    // ------------------------- Benchmark autopilot -------------------------
+
+    /** Synthesizes a straight swipe as Down / Move… / Up gesture events. */
+    private fun autoSwipe(
+        fromX: Float,
+        toX: Float,
+        y: Float,
+        durationMs: Long,
+        steps: Int = 16,
+        then: () -> Unit,
+    ) {
+        val start = SystemClock.uptimeMillis()
+        renderer.onGesture(GestureEvent.Down(fromX, y, start))
+        for (i in 1..steps) {
+            val f = i / steps.toFloat()
+            autoPilot.postDelayed(
+                {
+                    renderer.onGesture(
+                        GestureEvent.Move(
+                            fromX + (toX - fromX) * f,
+                            y,
+                            SystemClock.uptimeMillis(),
+                        ),
+                    )
+                },
+                durationMs * i / steps,
+            )
+        }
+        autoPilot.postDelayed(
+            {
+                renderer.onGesture(GestureEvent.Up(toX, y, SystemClock.uptimeMillis()))
+                then()
+            },
+            durationMs + 16L,
+        )
+    }
+
+    private fun autoOpenCover() {
+        val w = surfaceView.width.toFloat()
+        val h = surfaceView.height.toFloat()
+        if (w < 1f) {
+            autoPilot.postDelayed({ autoOpenCover() }, 500L)
+            return
+        }
+        autoSwipe(w * 0.93f, w * 0.2f, h * 0.5f, durationMs = 450L) {
+            autoPilot.postDelayed({ autoTurnLoop() }, 1_600L)
+        }
+    }
+
+    private fun autoTurnLoop() {
+        val w = surfaceView.width.toFloat()
+        val h = surfaceView.height.toFloat()
+        // Fast sweep ends as a flick: the page flies, curls, and its cast
+        // shadow crosses the spread below — the M10 hero effect.
+        autoSwipe(w * 0.82f, w * 0.18f, h * 0.52f, durationMs = 300L) {
+            autoPilot.postDelayed({ autoTurnLoop() }, 900L)
+        }
     }
 
     // ------------------------- Tuning harness UI ---------------------------
@@ -245,5 +317,6 @@ class BookActivity : Activity() {
         const val PAD = 24
         const val PANEL_WIDTH = 640
         const val TOGGLE_CLEARANCE = 140
+        const val EXTRA_AUTOPLAY = "autoplay"
     }
 }

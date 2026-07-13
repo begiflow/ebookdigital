@@ -23,6 +23,8 @@ class RestingPage(
     host: FilamentHost,
     materialInstance: MaterialInstance,
     private val facingPositiveZ: Boolean,
+    /** Local bounds covering any shape this page is given (M10 shadows). */
+    bounds: com.google.android.filament.Box,
 ) {
     private val mesh = DynamicMesh(
         host.engine,
@@ -30,6 +32,10 @@ class RestingPage(
         ROWS,
         materialInstance,
         flipWinding = !facingPositiveZ,
+        // The open spread is what the hero shadow of a turning page falls on.
+        castShadows = false,
+        receiveShadows = true,
+        boundingBox = bounds,
     )
 
     val entity: Int get() = mesh.entity

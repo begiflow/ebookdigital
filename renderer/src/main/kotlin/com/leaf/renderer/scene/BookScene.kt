@@ -3,7 +3,9 @@ package com.leaf.renderer.scene
 import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.opengl.Matrix
+import com.google.android.filament.Box
 import com.google.android.filament.EntityManager
+import com.google.android.filament.LightManager
 import com.google.android.filament.MaterialInstance
 import com.google.android.filament.Texture
 import com.google.android.filament.View
@@ -13,6 +15,7 @@ import com.leaf.filament.StaticMesh
 import com.leaf.filament.Textures
 import com.leaf.physics.PageParams
 import com.leaf.physics.PageStrip
+import com.leaf.renderer.DegradationRung
 import com.leaf.renderer.FeelEvent
 import com.leaf.renderer.PaperTuning
 import com.leaf.renderer.RenderBook
@@ -44,9 +47,16 @@ class BookScene(
     val pageHeightMeters: Float get() = pageH
 
     /** Key light entity + base aim, for the M9 tilt sway (docs/04 §3). */
-    val keyLightEntity: Int
+    var keyLightEntity: Int = 0
+        private set
     val keyLightDirection: FloatArray
         get() = floatArrayOf(KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
+
+    // M10 degradation state: flight-mesh density for NEW grabs; the key
+    // light is rebuilt on rung changes (shadow options are builder-time).
+    private var currentRung = DegradationRung.FULL
+    private var flightCols = FlightPage.DEFAULT_COLS
+    private var flightRows = FlightPage.DEFAULT_ROWS
 
     private val engine = host.engine
     private val transformManager = engine.transformManager
@@ -219,19 +229,19 @@ class BookScene(
         }
 
         // ---- Resting pages (persistent; reshaped per spread) ----
-        rightPage = RestingPage(host, rightPaperInstance, facingPositiveZ = true)
-        leftPage = RestingPage(host, leftPaperInstance, facingPositiveZ = false)
+        // Receiver bounds: generous but book-scale (the hero shadow of a
+        // turning page lands here; casters get the tight box).
+        val spreadBounds = Box(0f, 0f, 0f, w * 1.6f, h, w)
+        rightPage = RestingPage(host, rightPaperInstance, facingPositiveZ = true, bounds = spreadBounds)
+        leftPage = RestingPage(host, leftPaperInstance, facingPositiveZ = false, bounds = spreadBounds)
         transformManager.create(leftPage.entity, coverParentInstance, IDENTITY)
 
         setSpread(0)
         setCoverAngle(0f)
 
         // ---- Light rig ----
-        keyLightEntity = host.addDirectionalLight(
-            1f, 0.98f, 0.94f, 90_000f,
-            KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z,
-            castShadows = true,
-        )
+        keyLightEntity = addKeyLight(currentRung)
+        host.view.setShadowType(View.ShadowType.PCF)
         host.setAmbientLight(
             22_000f,
             floatArrayOf(
@@ -320,7 +330,12 @@ class BookScene(
         Textures.bind(backInstance, "baseColorMap", pageTexture(2 * sheet + 1))
         Textures.bind(backInstance, "backColorMap", pageTexture(2 * sheet))
 
-        val page = FlightPage(host, frontInstance, backInstance).also {
+        val page = FlightPage(
+            host, frontInstance, backInstance,
+            bounds = flightBounds,
+            cols = flightCols,
+            rows = flightRows,
+        ).also {
             host.scene.addEntity(it.frontEntity)
             host.scene.addEntity(it.backEntity)
             it.update(s, spineX, backInnerZ, pageH)
@@ -422,6 +437,49 @@ class BookScene(
                 restAngle = f.restAngle,
             )
         }
+    }
+
+    /**
+     * Tight world bounds around anywhere a flight page can deform — what the
+     * directional shadow frustum is fitted to (docs/04 §3).
+     */
+    private val flightBounds: Box
+        get() = Box(
+            spineX, 0f, backInnerZ + pageW * 0.45f,
+            pageW + GUTTER + 0.01f, pageH / 2f + 0.01f, pageW * 0.55f,
+        )
+
+    private fun addKeyLight(rung: DegradationRung): Int = host.addDirectionalLight(
+        1f, 0.98f, 0.94f, 90_000f,
+        KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z,
+        castShadows = true,
+        shadowOptions = LightManager.ShadowOptions().apply {
+            mapSize = if (rung == DegradationRung.FULL) SHADOW_MAP_FULL else SHADOW_MAP_REDUCED
+            // Bias tuned for a ~0.2 m scene (M10): small enough that the
+            // turning page's shadow stays attached at the spine (contact
+            // hardening), large enough to avoid acne across curl extremes.
+            constantBias = 0.0005f
+            normalBias = 1f
+            shadowFar = 1.5f
+            // Screen-space contact shadows ground the book on the desk and
+            // darken the cover-slightly-open crack (docs/04 §3); first to go.
+            screenSpaceContactShadows = rung == DegradationRung.FULL
+        },
+    )
+
+    /**
+     * Applies a degradation rung (docs/02 §7): shadow resolution, then
+     * flight-mesh density (new grabs), then the host's frame cap — the last
+     * is the renderer's job. Physics never degrades.
+     */
+    fun applyDegradationRung(rung: DegradationRung) {
+        if (rung == currentRung) return
+        currentRung = rung
+        host.removeLight(keyLightEntity)
+        keyLightEntity = addKeyLight(rung)
+        val reducedMesh = rung.ordinal >= DegradationRung.REDUCED_MESH.ordinal
+        flightCols = if (reducedMesh) FlightPage.REDUCED_COLS else FlightPage.DEFAULT_COLS
+        flightRows = if (reducedMesh) FlightPage.REDUCED_ROWS else FlightPage.DEFAULT_ROWS
     }
 
     /** Applies live paper-feel tuning; physics params take effect on the next grab. */
@@ -686,6 +744,10 @@ class BookScene(
 
         // Edge tint (M9, docs/04 §2.1): handled-paper darkening at borders.
         const val EDGE_TINT = 0.055f
+
+        // Shadow map sizes per degradation rung (M10).
+        const val SHADOW_MAP_FULL = 2048
+        const val SHADOW_MAP_REDUCED = 1024
 
         // Flight pool + riffle (M8).
         const val MAX_FLIGHTS = 3

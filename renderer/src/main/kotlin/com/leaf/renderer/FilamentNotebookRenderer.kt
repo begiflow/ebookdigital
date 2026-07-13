@@ -38,6 +38,10 @@ class FilamentNotebookRenderer : NotebookRenderer {
     private val raycaster = Raycaster(FilamentHost.VERTICAL_FOV_DEGREES.toFloat())
     private val rifflePacer = RifflePacer()
 
+    // M10: frame-time driven quality ladder (docs/02 §7).
+    private val ladder = DegradationLadder()
+    private var appliedRung = DegradationRung.FULL
+
     // M9 key sway: gravity sensor tilt leans the key light ~1° so paper
     // grain shimmers as the reader moves (docs/04-GRAPHICS-PIPELINE.md §3).
     private var keySway: KeySway? = null
@@ -394,6 +398,16 @@ class FilamentNotebookRenderer : NotebookRenderer {
             }
         }
 
+        // Degradation ladder (M10): sustained vsync misses step quality down;
+        // sustained headroom steps it back up. Physics dt stays fixed.
+        val rung = ladder.feed(dt)
+        if (rung != appliedRung) {
+            appliedRung = rung
+            scene?.applyDegradationRung(rung)
+            host.minFramePeriodNanos =
+                if (rung == DegradationRung.CAPPED_60) CAP_60_PERIOD_NANOS else 0L
+        }
+
         rig?.let {
             it.update(dt)
             val fraction = hinge?.let { h -> (h.angle / h.openRestAngle).coerceIn(0f, 1f) } ?: 0f
@@ -449,5 +463,6 @@ class FilamentNotebookRenderer : NotebookRenderer {
         const val FLICK_VELOCITY = 0.35f
         const val REGRAB_RADIUS = 0.02f
         const val RIFFLE_SPEED_DECAY = 6f
+        const val CAP_60_PERIOD_NANOS = 1_000_000_000L / 60L
     }
 }
