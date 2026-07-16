@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
                     onDelete = { book ->
                         lifecycleScope.launch { repository.delete(NotebookId(book.id)) }
                     },
+                    onEditPages = { book -> EditPagesActivity.open(this, book.id) },
                 )
             }
         }

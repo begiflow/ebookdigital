@@ -25,18 +25,7 @@ class TexturePipeline(private val store: FileStore) {
 
     /** Regenerates texture + thumb for [pageId]. False if no original. */
     fun regenerate(pageId: String, edits: EditParams): Boolean {
-        val original = store.originalFile(pageId)
-        if (!original.exists()) return false
-        var bitmap = BitmapFactory.decodeFile(original.absolutePath) ?: return false
-
-        edits.cropQuad?.let { bitmap = dewarp(bitmap, it) }
-        if (edits.rotationDeg % 360 != 0) {
-            val m = Matrix().apply { postRotate(edits.rotationDeg.toFloat()) }
-            bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
-        }
-        if (edits.brightness != 0f || edits.contrast != 0f) {
-            bitmap = colorAdjust(bitmap, edits.brightness, edits.contrast)
-        }
+        var bitmap = editedBitmap(pageId, edits) ?: return false
         bitmap = downscale(bitmap, MAX_TEXTURE_SIZE)
 
         // Texture: RGBA mip chain in a KTX container.
@@ -51,6 +40,33 @@ class TexturePipeline(private val store: FileStore) {
         thumb.compress(Bitmap.CompressFormat.JPEG, 85, out)
         store.writeThumb(pageId, out.toByteArray())
         return true
+    }
+
+    /**
+     * The edited derivative as a full-quality JPEG — what page sharing
+     * exports (docs/01 §5.6: users share what they see, never the original).
+     */
+    fun exportEditedJpeg(pageId: String, edits: EditParams): ByteArray? {
+        val bitmap = editedBitmap(pageId, edits) ?: return null
+        val out = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        return out.toByteArray()
+    }
+
+    /** Original decoded with [edits] applied — pixels in memory only. */
+    private fun editedBitmap(pageId: String, edits: EditParams): Bitmap? {
+        val original = store.originalFile(pageId)
+        if (!original.exists()) return null
+        var bitmap = BitmapFactory.decodeFile(original.absolutePath) ?: return null
+        edits.cropQuad?.let { bitmap = dewarp(bitmap, it) }
+        if (edits.rotationDeg % 360 != 0) {
+            val m = Matrix().apply { postRotate(edits.rotationDeg.toFloat()) }
+            bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
+        }
+        if (edits.brightness != 0f || edits.contrast != 0f) {
+            bitmap = colorAdjust(bitmap, edits.brightness, edits.contrast)
+        }
+        return bitmap
     }
 
     private fun dewarp(source: Bitmap, quad: com.leaf.domain.model.CropQuad): Bitmap {

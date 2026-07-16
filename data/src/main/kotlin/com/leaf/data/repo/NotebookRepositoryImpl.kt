@@ -98,6 +98,24 @@ class NotebookRepositoryImpl(
         }
     }
 
+    override suspend fun updateSheets(id: NotebookId, sheets: List<Sheet>) {
+        dao.deleteSheets(id.value)
+        dao.upsertPages(
+            sheets.flatMap { listOf(it.front.toRow(id.value, ROLE_SHEET), it.back.toRow(id.value, ROLE_SHEET)) },
+        )
+        dao.upsertSheets(
+            sheets.map {
+                SheetRow(
+                    id = it.id.value,
+                    notebookId = id.value,
+                    sheetIndex = it.index,
+                    frontPageId = it.front.id.value,
+                    backPageId = it.back.id.value,
+                )
+            },
+        )
+    }
+
     // ------------------------------ mapping --------------------------------
 
     private suspend fun assemble(row: NotebookRow): Notebook {

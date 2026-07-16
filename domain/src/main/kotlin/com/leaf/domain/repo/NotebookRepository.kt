@@ -4,6 +4,7 @@ import com.leaf.domain.model.EditParams
 import com.leaf.domain.model.Notebook
 import com.leaf.domain.model.NotebookId
 import com.leaf.domain.model.PageId
+import com.leaf.domain.model.Sheet
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -32,4 +33,10 @@ interface NotebookRepository {
      * reload to pick up new texture refs.
      */
     suspend fun updateEdits(pageId: PageId, edits: EditParams)
+
+    /**
+     * Replaces a notebook's sheet list (editor insert/delete/reorder,
+     * docs/01 §5.5). Sheet order is the single source of page order.
+     */
+    suspend fun updateSheets(id: NotebookId, sheets: List<Sheet>)
 }

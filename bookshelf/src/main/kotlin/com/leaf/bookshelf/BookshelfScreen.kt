@@ -58,12 +58,13 @@ fun BookshelfScreen(
     onCreate: () -> Unit,
     onRename: (ShelfBook, String) -> Unit,
     onDelete: (ShelfBook) -> Unit,
+    onEditPages: (ShelfBook) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier.fillMaxSize().background(LeafColors.PaperWhite)) {
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
             items(books.chunked(3)) { row ->
-                ShelfRow(row, onOpen, onRename, onDelete)
+                ShelfRow(row, onOpen, onRename, onDelete, onEditPages)
             }
         }
         if (books.isEmpty()) {
@@ -86,6 +87,7 @@ private fun ShelfRow(
     onOpen: (ShelfBook) -> Unit,
     onRename: (ShelfBook, String) -> Unit,
     onDelete: (ShelfBook) -> Unit,
+    onEditPages: (ShelfBook) -> Unit,
 ) {
     Column {
         Row(
@@ -94,7 +96,7 @@ private fun ShelfRow(
             verticalAlignment = Alignment.Bottom,
         ) {
             for (book in row) {
-                BookOnShelf(book, onOpen, onRename, onDelete)
+                BookOnShelf(book, onOpen, onRename, onDelete, onEditPages)
             }
         }
         // The shelf board the row stands on.
@@ -113,6 +115,7 @@ private fun BookOnShelf(
     onOpen: (ShelfBook) -> Unit,
     onRename: (ShelfBook, String) -> Unit,
     onDelete: (ShelfBook) -> Unit,
+    onEditPages: (ShelfBook) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
@@ -158,6 +161,13 @@ private fun BookOnShelf(
                         onClick = {
                             menuOpen = false
                             renaming = true
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Edit pages") },
+                        onClick = {
+                            menuOpen = false
+                            onEditPages(book)
                         },
                     )
                     DropdownMenuItem(
