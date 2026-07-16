@@ -51,6 +51,9 @@ class BookActivity : Activity() {
 
         renderer = FilamentNotebookRenderer()
         renderer.attach(surfaceView)
+        // M13: page textures stream through the residency pool — 50 sheets
+        // (100 pages) exercise the zero-pop-in exit criterion.
+        renderer.setTextureProvider(SyntheticTextureProvider())
         renderer.load(makeBook(RenderBinding.SEWN))
 
         val root = FrameLayout(this)
@@ -168,7 +171,7 @@ class BookActivity : Activity() {
     private fun makeBook(binding: RenderBinding) = RenderBook(
         widthMeters = 0.148f,
         heightMeters = 0.210f,
-        sheetCount = 30,
+        sheetCount = 50,
         // Chunky booklet paper so wedge thickness changes read clearly.
         sheetThicknessMeters = 0.00045f,
         coverThicknessMeters = 0.002f,

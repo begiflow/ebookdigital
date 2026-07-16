@@ -25,6 +25,13 @@ interface NotebookRenderer {
 
     /** Forwards a raw touch event; the engine owns gesture interpretation. */
     fun onGesture(gesture: GestureEvent)
+
+    /**
+     * Installs the page-texture pull path (M13, docs/02 §4): the engine
+     * decides *what* to load (residency policy, docs/04 §4); the provider
+     * does the I/O. Null reverts to the book's bitmap provider.
+     */
+    fun setTextureProvider(provider: TextureProvider?)
 }
 
 /** Engine states per the state machine in docs/03-RENDERER.md §7. */

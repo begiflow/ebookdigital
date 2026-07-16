@@ -35,6 +35,43 @@ object Textures {
         return texture
     }
 
+    /**
+     * Creates a texture from precomputed RGBA8 mip levels (level 0 first) —
+     * the streaming path (docs/04 §4): no GPU mip generation, levels come
+     * from the pipeline's container.
+     */
+    fun fromMipLevels(
+        engine: Engine,
+        width: Int,
+        height: Int,
+        levels: List<ByteArray>,
+        srgb: Boolean = true,
+    ): Texture {
+        val texture = Texture.Builder()
+            .width(width)
+            .height(height)
+            .levels(levels.size)
+            .sampler(Texture.Sampler.SAMPLER_2D)
+            .format(if (srgb) Texture.InternalFormat.SRGB8_A8 else Texture.InternalFormat.RGBA8)
+            .build(engine)
+        var w = width
+        var h = height
+        for ((level, bytes) in levels.withIndex()) {
+            texture.setImage(
+                engine,
+                level,
+                Texture.PixelBufferDescriptor(
+                    java.nio.ByteBuffer.wrap(bytes),
+                    Texture.Format.RGBA,
+                    Texture.Type.UBYTE,
+                ),
+            )
+            w = maxOf(1, w / 2)
+            h = maxOf(1, h / 2)
+        }
+        return texture
+    }
+
     /** Binds [texture] to a sampler parameter with trilinear filtering. */
     fun bind(instance: MaterialInstance, parameter: String, texture: Texture) {
         val sampler = TextureSampler(
