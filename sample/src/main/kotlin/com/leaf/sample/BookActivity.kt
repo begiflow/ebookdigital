@@ -51,22 +51,7 @@ class BookActivity : Activity() {
 
         renderer = FilamentNotebookRenderer()
         renderer.attach(surfaceView)
-        renderer.load(
-            RenderBook(
-                widthMeters = 0.148f,
-                heightMeters = 0.210f,
-                sheetCount = 30,
-                // Chunky booklet paper so wedge thickness changes read clearly.
-                sheetThicknessMeters = 0.00045f,
-                coverThicknessMeters = 0.002f,
-                binding = RenderBinding.SEWN,
-                frontCover = CoverArt.vaccinationBooklet(),
-                pageBitmapProvider = PageArt::page,
-                paperStiffness = tuning.stiffness,
-                paperTranslucency = tuning.translucency,
-                grain = RenderGrain.LAID,
-            ),
-        )
+        renderer.load(makeBook(RenderBinding.SEWN))
 
         val root = FrameLayout(this)
         root.addView(surfaceView)
@@ -179,6 +164,22 @@ class BookActivity : Activity() {
         }
     }
 
+    /** The demo booklet; [binding] switches all four M11 binding strategies. */
+    private fun makeBook(binding: RenderBinding) = RenderBook(
+        widthMeters = 0.148f,
+        heightMeters = 0.210f,
+        sheetCount = 30,
+        // Chunky booklet paper so wedge thickness changes read clearly.
+        sheetThicknessMeters = 0.00045f,
+        coverThicknessMeters = 0.002f,
+        binding = binding,
+        frontCover = CoverArt.vaccinationBooklet(),
+        pageBitmapProvider = PageArt::page,
+        paperStiffness = tuning.stiffness,
+        paperTranslucency = tuning.translucency,
+        grain = RenderGrain.LAID,
+    )
+
     // ------------------------- Tuning harness UI ---------------------------
 
     private fun buildTuningOverlay(): View {
@@ -248,6 +249,18 @@ class BookActivity : Activity() {
             )
         }
         panel.addView(presets)
+
+        // M11: all four bindings demo-able — reload swaps the strategy.
+        val bindings = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        RenderBinding.entries.forEach { binding ->
+            bindings.addView(
+                Button(this).apply {
+                    text = binding.name.lowercase()
+                    setOnClickListener { renderer.load(makeBook(binding)) }
+                },
+            )
+        }
+        panel.addView(bindings)
 
         var swayOn = true
         panel.addView(

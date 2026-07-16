@@ -15,9 +15,11 @@ import com.leaf.filament.StaticMesh
 import com.leaf.filament.Textures
 import com.leaf.physics.PageParams
 import com.leaf.physics.PageStrip
+import com.leaf.physics.PivotModel
 import com.leaf.renderer.DegradationRung
 import com.leaf.renderer.FeelEvent
 import com.leaf.renderer.PaperTuning
+import com.leaf.renderer.RenderBinding
 import com.leaf.renderer.RenderBook
 import com.leaf.renderer.RenderGrain
 import com.leaf.renderer.geometry.BookGeometry
@@ -129,6 +131,16 @@ class BookScene(
     private val backInnerZ = -halfT + coverT
     private val spineX = -w / 2f
 
+    // Rest pose per binding (docs/03 §4): mild bow for SEWN, near flat for
+    // STAPLED, strong bow + lifted spine edge for GLUED (the V), flat SPIRAL.
+    private val restBow = when (book.binding) {
+        RenderBinding.SEWN -> BOW_HEIGHT
+        RenderBinding.STAPLED -> 0.0015f
+        RenderBinding.GLUED -> 0.005f
+        RenderBinding.SPIRAL -> 0.0008f
+    }
+    private val restSpineLift = if (book.binding == RenderBinding.GLUED) 0.0075f else 0f
+
     /**
      * Cover rest pose: past PI so the opened board slopes down and its free
      * edge lands on the desk — a fixed hinge at the spine top means the board
@@ -146,8 +158,14 @@ class BookScene(
         val plainMaterial = host.loadMaterial(
             assets.open("materials/ribbon.filamat").use { it.readBytes() },
         )
+        // SPIRAL uses the masked variant (punched-hole margin, docs/03 §4).
+        val paperFile = if (book.binding == RenderBinding.SPIRAL) {
+            "materials/paper_masked.filamat"
+        } else {
+            "materials/paper.filamat"
+        }
         paperMaterial = host.loadMaterial(
-            assets.open("materials/paper.filamat").use { it.readBytes() },
+            assets.open(paperFile).use { it.readBytes() },
         )
 
         // ---- Materials ----
@@ -189,6 +207,7 @@ class BookScene(
             srgb = false,
         )
         leftPaperInstance = newPaperInstance(paperMaterial, grainTexture)
+        markMirroredHoles(leftPaperInstance) // left pages: u runs spine->1
         rightPaperInstance = newPaperInstance(paperMaterial, grainTexture)
 
         hingeZ = halfT - coverT / 2f
@@ -200,7 +219,55 @@ class BookScene(
             BookGeometry.panel(w * 0.995f, h * 0.995f, 0f, 0f, backInnerZ + Z_EPS, facingPositiveZ = true),
             endpaperInstance,
         )
-        addStatic(BookGeometry.sewnSpine(h, halfT, -w / 2f), frontInstance)
+
+        // ---- Spine per binding (M11, docs/03 §4) ----
+        when (book.binding) {
+            RenderBinding.SEWN -> addStatic(BookGeometry.sewnSpine(h, halfT, spineX), frontInstance)
+            RenderBinding.STAPLED -> {
+                // Flat spine + two visible staples.
+                addStatic(
+                    BookGeometry.board(0.0015f, h, 2f * halfT * 0.98f, spineX - 0.00075f, 0f, 0f),
+                    frontInstance,
+                )
+                val stapleInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.75f, 0.76f, 0.78f)
+                    setParameter("roughness", 0.35f)
+                }
+                for (sy in floatArrayOf(-h * 0.22f, h * 0.22f)) {
+                    addStatic(
+                        BookGeometry.board(0.0012f, 0.012f, 2f * halfT * 0.55f, spineX - 0.0018f, sy, 0f),
+                        stapleInstance,
+                    )
+                }
+            }
+            RenderBinding.GLUED -> {
+                // Squared glue spine, darker than the cover.
+                val glueInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.38f, 0.33f, 0.27f)
+                    setParameter("roughness", 0.75f)
+                }
+                addStatic(
+                    BookGeometry.board(0.002f, h, 2f * halfT, spineX - 0.001f, 0f, 0f),
+                    glueInstance,
+                )
+            }
+            RenderBinding.SPIRAL -> {
+                // No spine board: the coil is the binding.
+                val wireInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.78f, 0.78f, 0.80f)
+                    setParameter("roughness", 0.32f)
+                }
+                addStatic(
+                    BookGeometry.spiralWire(
+                        height = h,
+                        coilRadius = halfT + 0.002f,
+                        wireRadius = 0.0008f,
+                        spineX = spineX,
+                    ),
+                    wireInstance,
+                )
+            }
+        }
         addStatic(
             BookGeometry.board(DESK_W, DESK_H, 0.002f, 0.05f, 0f, -halfT - 0.0045f),
             deskInstance,
@@ -314,17 +381,19 @@ class BookScene(
                 damping = paperTuning.damping,
                 airDrag = paperTuning.airDrag,
             ),
+            pivotModel(),
         )
         // Floors for the whole pool refresh below; resetFlat samples the
         // surface, so seed this strip's floors first.
         applySurfaces(s, sheet)
-        s.resetFlat(onRight = forward, bowHeight = BOW_HEIGHT)
+        s.resetFlat(onRight = forward, bowHeight = restBow)
         s.grab(u)
 
         // Flight faces: sheet front / back, mapped per the domain sheet model.
         // Each face also carries the *other* side's texture for show-through.
         val frontInstance = newPaperInstance(paperMaterial, grainTexture)
         val backInstance = newPaperInstance(paperMaterial, grainTexture)
+        markMirroredHoles(backInstance) // back-face uvs are u-mirrored
         Textures.bind(frontInstance, "baseColorMap", pageTexture(2 * sheet))
         Textures.bind(frontInstance, "backColorMap", pageTexture(2 * sheet + 1))
         Textures.bind(backInstance, "baseColorMap", pageTexture(2 * sheet + 1))
@@ -448,6 +517,20 @@ class BookScene(
             spineX, 0f, backInnerZ + pageW * 0.45f,
             pageW + GUTTER + 0.01f, pageH / 2f + 0.01f, pageW * 0.55f,
         )
+
+    /** Binding-specific root constraint (M11, docs/05 §2 constraint 3). */
+    private fun pivotModel(): PivotModel = when (book.binding) {
+        RenderBinding.SEWN -> PivotModel.Hinge()
+        RenderBinding.STAPLED -> PivotModel.Hinge(rootBendStiffness = 0.5f, foldAngle = 0f)
+        RenderBinding.GLUED -> PivotModel.Hinge(rootBendStiffness = 0.85f, foldAngle = 0.9f)
+        RenderBinding.SPIRAL -> PivotModel.Wire(
+            // Coil axis at the book's mid-plane (world z = 0), reaching past
+            // the block; slack is the punched hole's play on the wire.
+            centerZ = -backInnerZ,
+            radius = halfT + 0.002f,
+            slack = 0.0015f,
+        )
+    }
 
     private fun addKeyLight(rung: DegradationRung): Int = host.addDirectionalLight(
         1f, 0.98f, 0.94f, 90_000f,
@@ -642,8 +725,9 @@ class BookScene(
                 width = pageW,
                 height = pageH,
                 baseZ = -coverT / 2f - leftT - Z_EPS,
-                bowHeight = BOW_HEIGHT,
+                bowHeight = restBow,
                 spineU = 1f,
+                spineLift = restSpineLift,
             )
             Textures.bind(leftPaperInstance, "baseColorMap", pageTexture(leftPageIndex!!))
             // Other side of the same sheet, for show-through (docs/04 §2.1).
@@ -661,8 +745,9 @@ class BookScene(
                 width = pageW,
                 height = pageH,
                 baseZ = backInnerZ + rightT + Z_EPS,
-                bowHeight = BOW_HEIGHT,
+                bowHeight = restBow,
                 spineU = 0f,
+                spineLift = restSpineLift,
             )
             Textures.bind(rightPaperInstance, "baseColorMap", pageTexture(rightPageIndex!!))
             Textures.bind(rightPaperInstance, "backColorMap", pageTexture(rightPageIndex + 1))
@@ -702,10 +787,25 @@ class BookScene(
             setParameter("showThrough", paperTuning.translucency)
             setParameter("keyLightDir", KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
             setParameter("edgeTint", EDGE_TINT)
+            if (book.binding == RenderBinding.SPIRAL) {
+                // Punched-hole margin (paper_masked.mat). holeU flips to the
+                // mirrored edge for faces whose u runs away from the spine.
+                setParameter("pageSize", pageW, pageH)
+                setParameter("holeCount", HOLE_COUNT)
+                setParameter("holeRadius", HOLE_RADIUS)
+                setParameter("holeU", HOLE_U)
+            }
             Textures.bind(this, "grainNormal", grain)
             // All samplers must be bound; real back textures rebind per page.
             Textures.bind(this, "backColorMap", pageTexture(BLANK_PAGE_INDEX))
         }
+
+    /** Faces whose texture u is mirrored keep their holes at the spine. */
+    private fun markMirroredHoles(instance: MaterialInstance) {
+        if (book.binding == RenderBinding.SPIRAL) {
+            instance.setParameter("holeU", 1f - HOLE_U)
+        }
+    }
 
     private fun addStatic(
         data: MeshData,
@@ -732,6 +832,11 @@ class BookScene(
         const val BOARD_COLOR = 0xFF6D4A2F.toInt()
         const val Z_EPS = 0.00015f
         const val DESK_GAP = 0.0045f
+
+        // SPIRAL punched holes (M11): margin column in u, sizes in meters.
+        const val HOLE_U = 0.05f
+        const val HOLE_COUNT = 9f
+        const val HOLE_RADIUS = 0.0028f
         const val DESK_W = 0.85f
         const val DESK_H = 1.2f
         val IDENTITY = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
