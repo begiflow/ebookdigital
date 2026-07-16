@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             LeafTheme {
+                UninstallWarningOnFirstRun()
                 val notebooks by repository.shelf().collectAsState(initial = emptyList())
                 BookshelfScreen(
                     books = notebooks.map {
@@ -67,6 +68,38 @@ class MainActivity : ComponentActivity() {
         // A finished scan session waits in staging; fold it into the shelf.
         lifecycleScope.launch {
             importer.importPending(File(filesDir, "capture-staging"))
+        }
+    }
+
+    /**
+     * Storage-integrity notice (M16, docs/01-PRD.md §6): originals live only
+     * on this device; uninstalling deletes them. Per-page "Export original"
+     * in the editor is the escape hatch. Shown once.
+     */
+    @androidx.compose.runtime.Composable
+    private fun UninstallWarningOnFirstRun() {
+        val prefs = getSharedPreferences("leaf", MODE_PRIVATE)
+        var show by androidx.compose.runtime.remember {
+            androidx.compose.runtime.mutableStateOf(!prefs.getBoolean("uninstall_warned", false))
+        }
+        if (show) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = {},
+                title = { androidx.compose.material3.Text("Your notebooks live here") },
+                text = {
+                    androidx.compose.material3.Text(
+                        "Scanned originals are stored only on this device — " +
+                            "uninstalling LEAF deletes them. Use \"Export original\" " +
+                            "on any page to keep a copy elsewhere.",
+                    )
+                },
+                confirmButton = {
+                    androidx.compose.material3.Button(onClick = {
+                        prefs.edit().putBoolean("uninstall_warned", true).apply()
+                        show = false
+                    }) { androidx.compose.material3.Text("Understood") }
+                },
+            )
         }
     }
 }

@@ -47,6 +47,7 @@ fun EditorScreen(
     initial: EditParams,
     onSave: (EditParams) -> Unit,
     onShare: (EditParams) -> Unit,
+    onExportOriginal: () -> Unit,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -150,6 +151,9 @@ fun EditorScreen(
                 touch()
             }) { Text("Reset") }
             Button(onClick = { onShare(draft.params) }) { Text("Share") }
+            // The storage-integrity escape hatch (docs/01 §6): the only path
+            // that copies an original off-device.
+            TextButton(onClick = onExportOriginal) { Text("Export original") }
             Button(onClick = { onSave(draft.params) }) { Text("Save") }
             TextButton(onClick = onClose) { Text("Close") }
         }

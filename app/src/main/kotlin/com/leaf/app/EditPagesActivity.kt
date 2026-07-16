@@ -130,6 +130,7 @@ class EditPagesActivity : ComponentActivity() {
                                 }
                             },
                             onShare = { params -> sharePage(current.id.value, params) },
+                            onExportOriginal = { shareOriginal(current.id.value) },
                             onClose = { editing = null },
                         )
                     }
@@ -188,6 +189,34 @@ class EditPagesActivity : ComponentActivity() {
                         .putExtra(Intent.EXTRA_STREAM, uri)
                         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
                     "Share page",
+                ),
+            )
+        }
+    }
+
+    /**
+     * The storage-integrity escape hatch (M16, docs/01-PRD.md §6): shares
+     * the untouched original bytes — the only copy path off-device.
+     */
+    private fun shareOriginal(pageId: String) {
+        lifecycleScope.launch {
+            val source = store.originalFile(pageId)
+            if (!source.exists()) return@launch
+            val dir = File(cacheDir, "shared").apply { mkdirs() }
+            val file = File(dir, "original-$pageId.jpg")
+            withContext(Dispatchers.IO) { source.copyTo(file, overwrite = true) }
+            val uri = FileProvider.getUriForFile(
+                this@EditPagesActivity,
+                "$packageName.fileprovider",
+                file,
+            )
+            startActivity(
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND)
+                        .setType("image/jpeg")
+                        .putExtra(Intent.EXTRA_STREAM, uri)
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                    "Export original",
                 ),
             )
         }
