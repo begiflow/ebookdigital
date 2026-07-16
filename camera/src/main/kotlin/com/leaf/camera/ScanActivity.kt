@@ -46,7 +46,14 @@ class ScanActivity : ComponentActivity() {
         setContent {
             val state by controller.state.collectAsState()
             if (state.stage == ScanSession.Stage.Review) {
-                ReviewScreen(controller = controller, onDone = { finish() })
+                ReviewScreen(
+                    controller = controller,
+                    onDone = {
+                        controller.writeManifest()
+                        setResult(RESULT_OK)
+                        finish()
+                    },
+                )
             } else {
                 ScanScreen(controller = controller, lifecycleOwner = this)
             }

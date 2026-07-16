@@ -18,11 +18,14 @@ android {
 dependencies {
     implementation(project(":designsystem"))
     implementation(project(":domain"))
+    implementation(project(":data")) // composition root binds the impls (docs/02 §6)
     implementation(project(":renderer"))
     implementation(project(":bookshelf"))
     implementation(project(":editor"))
     implementation(project(":camera"))
     implementation(project(":search"))
+
+    implementation(libs.kotlinx.coroutines.android)
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

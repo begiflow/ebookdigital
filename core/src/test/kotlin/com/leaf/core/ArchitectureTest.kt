@@ -63,7 +63,9 @@ class ArchitectureTest {
 
     @Test
     fun `features never import the data layer`() {
-        for (feature in listOf("bookshelf", "editor", "camera", "search", "app")) {
+        // :app is exempt — it is the composition root that binds :data's
+        // implementations into the DI graph (docs/02-ARCHITECTURE.md §6).
+        for (feature in listOf("bookshelf", "editor", "camera", "search")) {
             assertNoImports(
                 module = feature,
                 forbiddenPrefixes = listOf("com.leaf.data"),

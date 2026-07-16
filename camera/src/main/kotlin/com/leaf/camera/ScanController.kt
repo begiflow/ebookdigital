@@ -230,6 +230,22 @@ class ScanController(
         return if (orig.exists()) orig else null
     }
 
+    /**
+     * Writes the session as a line-based manifest into the staging dir so
+     * the app can import it into the repository (M14). Format per line:
+     * `cover <SLOT> <id>` / `page <id|blank> <rotationDeg>`.
+     */
+    fun writeManifest() {
+        val lines = ArrayList<String>()
+        for ((slot, capture) in session.covers) {
+            lines.add("cover ${slot.name} ${capture.id}")
+        }
+        for (page in session.pages) {
+            lines.add("page ${if (page.blank) "blank" else page.id.toString()} ${page.rotationDeg}")
+        }
+        File(stagingDir, MANIFEST_NAME).writeText(lines.joinToString("\n"))
+    }
+
     private fun publish() {
         val retake = retakingIndex
         mutableState.value = mutableState.value.copy(
@@ -247,7 +263,8 @@ class ScanController(
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
     }
 
-    private companion object {
-        const val TAG = "LeafScan"
+    companion object {
+        private const val TAG = "LeafScan"
+        const val MANIFEST_NAME = "session.manifest"
     }
 }
