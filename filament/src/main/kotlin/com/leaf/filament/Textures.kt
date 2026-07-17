@@ -57,6 +57,13 @@ object Textures {
         var w = width
         var h = height
         for ((level, bytes) in levels.withIndex()) {
+            val expectedSize = w * h * 4
+            if (bytes.size < expectedSize) {
+                throw IllegalArgumentException(
+                    "Buffer for level $level is too small: " +
+                        "got ${bytes.size}, expected $expectedSize ($w x $h x 4)"
+                )
+            }
             texture.setImage(
                 engine,
                 level,
@@ -65,6 +72,7 @@ object Textures {
                     Texture.Format.RGBA,
                     Texture.Type.UBYTE,
                 ),
+                0, 0, w, h
             )
             w = maxOf(1, w / 2)
             h = maxOf(1, h / 2)
