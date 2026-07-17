@@ -64,15 +64,16 @@ object Textures {
                         "got ${bytes.size}, expected $expectedSize ($w x $h x 4)"
                 )
             }
+            // Region overload: offsets and size precede the descriptor.
             texture.setImage(
                 engine,
                 level,
+                0, 0, w, h,
                 Texture.PixelBufferDescriptor(
                     java.nio.ByteBuffer.wrap(bytes),
                     Texture.Format.RGBA,
                     Texture.Type.UBYTE,
                 ),
-                0, 0, w, h
             )
             w = maxOf(1, w / 2)
             h = maxOf(1, h / 2)
