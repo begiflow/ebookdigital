@@ -1,5 +1,6 @@
 package com.leaf.renderer.scene
 
+import com.google.android.filament.Box
 import com.google.android.filament.MaterialInstance
 import com.leaf.filament.DynamicMesh
 import com.leaf.filament.FilamentHost
@@ -22,22 +23,33 @@ class FlightPage(
     host: FilamentHost,
     frontInstance: MaterialInstance,
     backInstance: MaterialInstance,
+    /** Tight local bounds around anywhere the page can deform (M10 shadows). */
+    bounds: Box,
+    /** Grid density; the degradation ladder may lower it (docs/02 §7). */
+    private val cols: Int = DEFAULT_COLS,
+    private val rows: Int = DEFAULT_ROWS,
 ) {
-    private val front = DynamicMesh(host.engine, COLS, ROWS, frontInstance)
-    private val back = DynamicMesh(host.engine, COLS, ROWS, backInstance, flipWinding = true)
-    private val deformer = PageDeformer(COLS, ROWS)
+    private val front = DynamicMesh(
+        host.engine, cols, rows, frontInstance,
+        castShadows = true, receiveShadows = true, boundingBox = bounds,
+    )
+    private val back = DynamicMesh(
+        host.engine, cols, rows, backInstance, flipWinding = true,
+        castShadows = true, receiveShadows = true, boundingBox = bounds,
+    )
+    private val deformer = PageDeformer(cols, rows)
 
     val frontEntity: Int get() = front.entity
     val backEntity: Int get() = back.entity
 
     init {
         // Back face: mirrored u (its texture reads as a left page).
-        val uvs = FloatArray(COLS * ROWS * 2)
+        val uvs = FloatArray(cols * rows * 2)
         var i = 0
-        for (r in 0 until ROWS) {
-            val v = r / (ROWS - 1f)
-            for (c in 0 until COLS) {
-                uvs[i++] = 1f - c / (COLS - 1f)
+        for (r in 0 until rows) {
+            val v = r / (rows - 1f)
+            for (c in 0 until cols) {
+                uvs[i++] = 1f - c / (cols - 1f)
                 uvs[i++] = v
             }
         }
@@ -79,10 +91,10 @@ class FlightPage(
         val d = deformer
         var pi = 0
         var ti = 0
-        for (r in 0 until ROWS) {
-            val y = (r / (ROWS - 1f) - 0.5f) * pageHeight
-            val row = r * COLS
-            for (c in 0 until COLS) {
+        for (r in 0 until rows) {
+            val y = (r / (rows - 1f) - 0.5f) * pageHeight
+            val row = r * cols
+            for (c in 0 until cols) {
                 val i = row + c
                 pos[pi++] = spineX + d.posX[i]
                 pos[pi++] = y
@@ -122,8 +134,10 @@ class FlightPage(
         }
     }
 
-    private companion object {
-        const val COLS = 32
-        const val ROWS = 8
+    companion object {
+        const val DEFAULT_COLS = 32
+        const val DEFAULT_ROWS = 8
+        const val REDUCED_COLS = 24
+        const val REDUCED_ROWS = 6
     }
 }

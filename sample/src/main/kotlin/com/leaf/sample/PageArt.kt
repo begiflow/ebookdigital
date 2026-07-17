@@ -16,6 +16,14 @@ import kotlin.random.Random
 object PageArt {
 
     fun page(index: Int, width: Int = 512, height: Int = 726): Bitmap {
+        // Sheet 1 front carries the color-fidelity chart (M9): hold the
+        // device next to a printed checker under the same lamp — the neutral
+        // pipeline (docs/04 §5) must keep them matching.
+        if (index == 2) return colorChecker(width, height)
+        return recordPage(index, width, height)
+    }
+
+    private fun recordPage(index: Int, width: Int, height: Int): Bitmap {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -87,6 +95,77 @@ object PageArt {
         paint.textSize = width * 0.04f
         canvas.drawText("${index + 1}", width / 2f, height * 0.965f, paint)
 
+        return bitmap
+    }
+
+    /**
+     * ColorChecker-style chart + gray ramp for the M9 side-by-side color
+     * validation (docs/04 §5 exit: scanned page on screen matches paper
+     * under a lamp). sRGB patch values are the classic 24-target set.
+     */
+    private fun colorChecker(width: Int, height: Int): Bitmap {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        canvas.drawColor(0xFFF4EEDE.toInt())
+        paint.color = 0xFF3A4A6B.toInt()
+        paint.typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD)
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = width * 0.045f
+        canvas.drawText("COLOR FIDELITY", width / 2f, height * 0.08f, paint)
+
+        val patches = intArrayOf(
+            0xFF735244.toInt(), 0xFFC29682.toInt(), 0xFF627A9D.toInt(),
+            0xFF576C43.toInt(), 0xFF8580B1.toInt(), 0xFF67BDAA.toInt(),
+            0xFFD67E2C.toInt(), 0xFF505BA6.toInt(), 0xFFC15A63.toInt(),
+            0xFF5E3C6C.toInt(), 0xFF9DBC40.toInt(), 0xFFE0A32E.toInt(),
+            0xFF383D96.toInt(), 0xFF469449.toInt(), 0xFFAF363C.toInt(),
+            0xFFE7C71F.toInt(), 0xFFBB5695.toInt(), 0xFF0885A1.toInt(),
+            0xFFF3F3F2.toInt(), 0xFFC8C8C8.toInt(), 0xFFA0A0A0.toInt(),
+            0xFF7A7A79.toInt(), 0xFF555555.toInt(), 0xFF343434.toInt(),
+        )
+        val cols = 4
+        val rows = 6
+        val gridLeft = width * 0.10f
+        val gridTop = height * 0.13f
+        val gridRight = width * 0.90f
+        val gridBottom = height * 0.72f
+        val cellW = (gridRight - gridLeft) / cols
+        val cellH = (gridBottom - gridTop) / rows
+        paint.style = Paint.Style.FILL
+        for (i in patches.indices) {
+            val c = i % cols
+            val r = i / cols
+            paint.color = patches[i]
+            canvas.drawRect(
+                gridLeft + c * cellW + 2f,
+                gridTop + r * cellH + 2f,
+                gridLeft + (c + 1) * cellW - 2f,
+                gridTop + (r + 1) * cellH - 2f,
+                paint,
+            )
+        }
+
+        // 11-step gray ramp: tone-mapping curvature shows up here first.
+        val rampTop = height * 0.76f
+        val rampBottom = height * 0.86f
+        for (i in 0..10) {
+            val v = (255 * i / 10)
+            paint.color = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            canvas.drawRect(
+                gridLeft + (gridRight - gridLeft) * i / 11f,
+                rampTop,
+                gridLeft + (gridRight - gridLeft) * (i + 1) / 11f,
+                rampBottom,
+                paint,
+            )
+        }
+
+        paint.color = 0xFF6B675C.toInt()
+        paint.typeface = Typeface.SERIF
+        paint.textSize = width * 0.035f
+        canvas.drawText("3", width / 2f, height * 0.965f, paint)
         return bitmap
     }
 }

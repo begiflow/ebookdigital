@@ -1,0 +1,59 @@
+// SPIRAL paper (M11, docs/03 §4): identical to paper.mat plus a punched-hole
+// left margin cut with masked blending. Holes are procedural (uv math, no
+// texture): [holeCount] circles of [holeRadius] meters centered on the
+// [holeU] column, sized against [pageSize].
+// Recompile: tools/filament/bin/matc -p mobile -a opengl -a vulkan \
+//   -o filament/src/main/assets/materials/paper_masked.filamat filament/src/main/materials/paper_masked.mat
+material {
+    name : PaperMasked,
+    shadingModel : lit,
+    blending : masked,
+    maskThreshold : 0.5,
+    requires : [ uv0 ],
+    parameters : [
+        { type : sampler2d, name : baseColorMap },
+        { type : sampler2d, name : backColorMap },
+        { type : sampler2d, name : grainNormal },
+        { type : float, name : roughness },
+        { type : float, name : grainStrength },
+        { type : float2, name : grainTiling },
+        { type : float, name : showThrough },
+        { type : float3, name : keyLightDir },
+        { type : float, name : edgeTint },
+        { type : float, name : holeU },
+        { type : float2, name : pageSize },
+        { type : float, name : holeCount },
+        { type : float, name : holeRadius }
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        vec2 uv = getUV0();
+        vec3 grain = texture(materialParams_grainNormal, uv * materialParams.grainTiling).xyz * 2.0 - 1.0;
+        material.normal = normalize(mix(vec3(0.0, 0.0, 1.0), grain, materialParams.grainStrength));
+        prepareMaterial(material);
+
+        vec4 base = texture(materialParams_baseColorMap, uv);
+
+        vec3 back = textureLod(materialParams_backColorMap, vec2(1.0 - uv.x, uv.y), 3.0).rgb;
+        float behind = saturate(dot(getWorldGeometricNormalVector(), materialParams.keyLightDir));
+        float bleed = materialParams.showThrough * (0.35 + 0.65 * behind);
+        base.rgb *= mix(vec3(1.0), back, bleed);
+
+        float border = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+        float ring = 1.0 - smoothstep(0.0, 0.035, border);
+        base.rgb *= 1.0 - materialParams.edgeTint * ring;
+
+        // Punched holes: distance in meters from the nearest hole center.
+        vec2 d = vec2(
+            (uv.x - materialParams.holeU) * materialParams.pageSize.x,
+            (fract(uv.y * materialParams.holeCount) - 0.5) * materialParams.pageSize.y / materialParams.holeCount
+        );
+        base.a = length(d) < materialParams.holeRadius ? 0.0 : 1.0;
+
+        material.baseColor = base;
+        material.roughness = materialParams.roughness;
+        material.metallic = 0.0;
+    }
+}

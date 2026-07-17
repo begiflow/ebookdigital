@@ -1,6 +1,7 @@
 package com.leaf.physics
 
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
@@ -15,12 +16,27 @@ import kotlin.math.sqrt
  *
  * Deterministic: fixed-dt stepping, no randomness, pure float math.
  */
-class PageStrip(val params: PageParams) {
+class PageStrip(
+    val params: PageParams,
+    val pivot: PivotModel = PivotModel.Hinge(),
+) {
 
     enum class Settle { IN_FLIGHT, SETTLED_LEFT, SETTLED_RIGHT }
 
     val n = params.particleCount
     private val seg = params.widthMeters / (n - 1)
+
+    // Binding-derived flags, hoisted so the SEWN path stays branch-identical
+    // to the reference implementation (golden traces are blessed on it).
+    private val wire = pivot as? PivotModel.Wire
+    private val hinge = pivot as? PivotModel.Hinge
+    private val rootDynamic = wire != null
+    private val rootBendActive = hinge != null && hinge.rootBendStiffness > 0f
+    private val rootBendK = hinge?.rootBendStiffness ?: 0f
+
+    /** Rest chord p0..p2 encoding the root fold (2·seg = straight). */
+    private val rootRestChord =
+        if (hinge != null) 2f * seg * cos(hinge.foldAngle / 2f) else 2f * seg
 
     /** Particle positions, exposed read-only for extrusion. */
     val px = FloatArray(n)
@@ -74,8 +90,19 @@ class PageStrip(val params: PageParams) {
             vx[i] = 0f
             vz[i] = 0f
         }
-        pz[0] = PIVOT_Z
-        px[0] = 0f
+        val w = wire
+        if (w != null) {
+            // Root = punched-hole edge on the coil: start at the circle
+            // point facing the resting side; the solver slides it from there.
+            val side = if (onRight) 1f else -1f
+            px[0] = side * w.radius * WIRE_START_COS
+            pz[0] = w.centerZ - w.radius * WIRE_START_SIN
+            vx[0] = 0f
+            vz[0] = 0f
+        } else {
+            pz[0] = PIVOT_Z
+            px[0] = 0f
+        }
         grabbedIndex = -1
         bias = 0f
         settle = Settle.IN_FLIGHT
@@ -101,14 +128,38 @@ class PageStrip(val params: PageParams) {
 
     /**
      * [directionHint] from flick velocity: -1 finish left, +1 fall back
-     * right, 0 = decide from the free edge's lean.
+     * right, 0 = decide from momentum + lean (docs/05 §3): if the outer
+     * third of the page carries clear sideways speed, it wins; otherwise
+     * the free edge's lean does.
      */
     fun release(directionHint: Int) {
         if (grabbedIndex < 0) return
         grabbedIndex = -1
         bias = when {
             directionHint != 0 -> directionHint.toFloat()
-            else -> if (px[n - 1] < 0f) -1f else 1f
+            else -> {
+                var meanVx = 0f
+                val outer = n - n / 3
+                for (i in outer until n) meanVx += vx[i]
+                meanVx /= (n - outer)
+                when {
+                    meanVx < -RELEASE_MOMENTUM -> -1f
+                    meanVx > RELEASE_MOMENTUM -> 1f
+                    else -> if (px[n - 1] < 0f) -1f else 1f
+                }
+            }
+        }
+    }
+
+    /**
+     * Kicks the free edge (riffle: the thumb flicks the page without holding
+     * it). Velocity ramps from the pivot to the tip like a real edge strike.
+     */
+    fun fling(speedX: Float, lift: Float) {
+        for (i in 1 until n) {
+            val s = i / (n - 1f)
+            vx[i] += speedX * s
+            vz[i] += lift * s
         }
     }
 
@@ -120,9 +171,15 @@ class PageStrip(val params: PageParams) {
 
     private fun substep(h: Float) {
         val dampingFactor = exp(-params.damping * h)
-        for (i in 1 until n) {
+        val first = if (rootDynamic) 0 else 1
+        for (i in first until n) {
             vz[i] += params.gravity * h
-            if (grabbedIndex < 0 && settle == Settle.IN_FLIGHT) {
+            // Turn-completion torque acts on airborne paper only: once a
+            // particle rests on the stack the bias lets go, so a landed page
+            // stops being pushed sideways and can actually settle (M8).
+            if (grabbedIndex < 0 && settle == Settle.IN_FLIGHT &&
+                pz[i] - surface(px[i]) > BIAS_LIFT_EPS
+            ) {
                 vx[i] += bias * BIAS_ACCEL * h
             }
             // Air drag ∝ -v·|v| (docs/05 §2), integrated implicitly so it can
@@ -153,7 +210,7 @@ class PageStrip(val params: PageParams) {
                 val len = sqrt(dx * dx + dz * dz)
                 if (len < 1e-9f) continue
                 val diff = (len - seg) / len
-                if (i == 0) {
+                if (i == 0 && !rootDynamic) {
                     // Pivot immovable: correction lands on the outer particle.
                     px[1] -= dx * diff
                     pz[1] -= dz * diff
@@ -164,15 +221,20 @@ class PageStrip(val params: PageParams) {
                     pz[i + 1] -= dz * diff * 0.5f
                 }
             }
-            // Bending: second-neighbor distance toward straight.
+            // Bending: second-neighbor distance toward the rest chord. The
+            // root vertex uses the binding's own stiffness + fold instead of
+            // the paper's (docs/05 §2 constraint 3: STAPLED tight, GLUED
+            // strongly bent — the V shape).
             for (i in 0 until n - 2) {
                 val dx = px[i + 2] - px[i]
                 val dz = pz[i + 2] - pz[i]
                 val len = sqrt(dx * dx + dz * dz)
                 if (len < 1e-9f) continue
-                val rest = 2f * seg
-                val diff = (len - rest) / len * bendStiffness
-                if (i == 0) {
+                val rootVertex = i == 0 && rootBendActive
+                val rest = if (rootVertex) rootRestChord else 2f * seg
+                val k = if (rootVertex) rootBendK else bendStiffness
+                val diff = (len - rest) / len * k
+                if (i == 0 && !rootDynamic) {
                     px[2] -= dx * diff
                     pz[2] -= dz * diff
                 } else {
@@ -182,6 +244,7 @@ class PageStrip(val params: PageParams) {
                     pz[i + 2] -= dz * diff * 0.5f
                 }
             }
+            wire?.let { projectWireRoot(it) }
             // Stack collision (projection).
             for (i in 1 until n) {
                 val floor = surface(px[i])
@@ -198,7 +261,7 @@ class PageStrip(val params: PageParams) {
                 val len = sqrt(dx * dx + dz * dz)
                 if (len < 1e-9f) continue
                 val diff = (len - seg) / len
-                if (i == 0) {
+                if (i == 0 && !rootDynamic) {
                     px[1] -= dx * diff
                     pz[1] -= dz * diff
                 } else {
@@ -209,6 +272,7 @@ class PageStrip(val params: PageParams) {
                 }
             }
         }
+        wire?.let { projectWireRoot(it) }
 
         // Closing collision clamp (the distance passes may have dipped a
         // particle below the stack again; the up-only nudge is sub-segment).
@@ -217,9 +281,27 @@ class PageStrip(val params: PageParams) {
             if (pz[i] < floor) pz[i] = floor
         }
 
-        for (i in 1 until n) {
+        for (i in first until n) {
             vx[i] = (px[i] - prevX[i]) / h
             vz[i] = (pz[i] - prevZ[i]) / h
+        }
+    }
+
+    /** SPIRAL: keep the hole edge riding the wire circle, within the slop. */
+    private fun projectWireRoot(w: PivotModel.Wire) {
+        val dx = px[0]
+        val dz = pz[0] - w.centerZ
+        val d = sqrt(dx * dx + dz * dz)
+        if (d < 1e-9f) {
+            px[0] = 0f
+            pz[0] = w.centerZ - (w.radius - w.slack)
+            return
+        }
+        val clamped = d.coerceIn(w.radius - w.slack, w.radius + w.slack)
+        if (clamped != d) {
+            val s = clamped / d
+            px[0] = dx * s
+            pz[0] = w.centerZ + dz * s
         }
     }
 
@@ -254,6 +336,12 @@ class PageStrip(val params: PageParams) {
         const val BIAS_ACCEL = 26f
         const val SETTLE_SPEED = 0.03f
         const val SETTLE_LIFT = 0.006f
+        const val RELEASE_MOMENTUM = 0.18f
+        const val BIAS_LIFT_EPS = 0.0015f
+
+        // Wire start pose: hole rides the coil ~34° below side-horizontal.
+        const val WIRE_START_COS = 0.83f
+        const val WIRE_START_SIN = 0.56f
         const val MIN_DRAG_LIFT = 0.002f
         const val REST_EPS = 0.0002f
         const val PIVOT_Z = 0.0008f

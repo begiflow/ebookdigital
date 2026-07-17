@@ -79,6 +79,26 @@ class PageStripTest {
     }
 
     @Test
+    fun `release momentum outweighs lean (docs 05 §3)`() {
+        val strip = newStrip()
+        strip.grab(0.9f)
+        // Park on the right, then sweep the finger left as a continuous
+        // motion and let go mid-swipe while the tip is still right of the
+        // spine — the page's momentum must win over its lean.
+        repeat(240) { strip.drag(0.09f, 0.06f); strip.step(dt) }
+        var x = 0.09f
+        repeat(12) {
+            x -= 0.0045f // ≈0.54 m/s swipe
+            strip.drag(x, 0.07f)
+            strip.step(dt)
+        }
+        assertTrue(strip.px[strip.n - 1] > 0f, "precondition: tip should still lean right")
+        strip.release(directionHint = 0)
+        strip.runUntilSettled()
+        assertEquals(PageStrip.Settle.SETTLED_LEFT, strip.settle)
+    }
+
+    @Test
     fun `flick hint overrides position`() {
         val strip = newStrip()
         strip.grab(0.9f)

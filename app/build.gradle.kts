@@ -10,24 +10,30 @@ android {
 
     defaultConfig {
         applicationId = "com.leaf.notebook"
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "1.0.0-rc1"
     }
 }
 
 dependencies {
     implementation(project(":designsystem"))
     implementation(project(":domain"))
+    implementation(project(":data")) // composition root binds the impls (docs/02 §6)
     implementation(project(":renderer"))
     implementation(project(":bookshelf"))
     implementation(project(":editor"))
     implementation(project(":camera"))
     implementation(project(":search"))
 
+    implementation(libs.kotlinx.coroutines.android)
+
+    implementation(libs.room.runtime)
+
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
     implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.core.ktx) // FileProvider (page sharing)
 
     implementation(libs.hilt.android)
     ksp(libs.hilt.compiler)

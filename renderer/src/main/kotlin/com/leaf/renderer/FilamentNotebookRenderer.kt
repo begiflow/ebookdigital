@@ -1,10 +1,15 @@
 package com.leaf.renderer
 
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.view.SurfaceView
 import com.leaf.filament.FilamentHost
 import com.leaf.physics.CoverHinge
-import com.leaf.physics.PageStrip
 import com.leaf.renderer.scene.BookScene
+import com.leaf.renderer.scene.RifflePacer
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.max
@@ -12,9 +17,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * The engine behind the NotebookRenderer API. M6 state: closed book,
- * interactive cover, and real page turning — ray-picked grabs driving the
- * PBD strip at a fixed 120Hz timestep (docs/03-RENDERER.md §3, §6).
+ * The engine behind the NotebookRenderer API. M8 state: closed book,
+ * interactive cover, multi-page turning (pool of 3), fore-edge riffle, and
+ * sound + haptic feedback — ray-picked grabs driving PBD strips at a fixed
+ * 120Hz timestep (docs/03-RENDERER.md §3, §6).
  */
 class FilamentNotebookRenderer : NotebookRenderer {
 
@@ -27,8 +33,28 @@ class FilamentNotebookRenderer : NotebookRenderer {
     private var rig: OrbitCameraRig? = null
     private var hinge: CoverHinge? = null
     private var loadedBook: RenderBook? = null
+    private var feedback: FeelFeedback? = null
+    private var textureProvider: TextureProvider? = null
 
     private val raycaster = Raycaster(FilamentHost.VERTICAL_FOV_DEGREES.toFloat())
+    private val rifflePacer = RifflePacer()
+
+    // M10: frame-time driven quality ladder (docs/02 §7).
+    private val ladder = DegradationLadder()
+    private var appliedRung = DegradationRung.FULL
+
+    // M9 key sway: gravity sensor tilt leans the key light ~1° so paper
+    // grain shimmers as the reader moves (docs/04-GRAPHICS-PIPELINE.md §3).
+    private var keySway: KeySway? = null
+    private var keySwayEnabled = true
+    private var sensorManager: SensorManager? = null
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            keySway?.setTilt(event.values[0], event.values[1], event.values[2])
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
 
     private var lastFrameNanos = 0L
     private var simAccumulator = 0f
@@ -48,11 +74,18 @@ class FilamentNotebookRenderer : NotebookRenderer {
     private var lastSimTimeMillis = 0L
     private var simVelocityX = 0f
 
-    private enum class TouchMode { NONE, ORBIT, COVER, PAGE }
+    private enum class TouchMode { NONE, ORBIT, COVER, PAGE, RIFFLE }
 
     override fun attach(surfaceView: SurfaceView) {
         check(host == null) { "already attached" }
         this.surfaceView = surfaceView
+        feedback = FeelFeedback(surfaceView.context)
+        sensorManager =
+            (surfaceView.context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager)?.also { sm ->
+                val gravity = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+                    ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+                gravity?.let { sm.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME) }
+            }
         host = FilamentHost(surfaceView).also {
             it.frameListener = ::frame
             it.resume()
@@ -60,10 +93,14 @@ class FilamentNotebookRenderer : NotebookRenderer {
     }
 
     override fun detach() {
+        sensorManager?.unregisterListener(sensorListener)
+        sensorManager = null
         scene?.destroy()
         scene = null
         host?.destroy()
         host = null
+        feedback?.release()
+        feedback = null
         surfaceView = null
         mutableState.value = BookState.Unloaded
     }
@@ -74,7 +111,10 @@ class FilamentNotebookRenderer : NotebookRenderer {
 
         scene?.destroy()
         val newScene = BookScene(host, book, assets)
+        newScene.onFeel = { event -> feedback?.on(event) }
+        newScene.setTextureProvider(textureProvider)
         scene = newScene
+        keySway = newScene.keyLightDirection.let { KeySway(it[0], it[1], it[2]) }
         hinge = CoverHinge(
             openRestAngle = newScene.coverOpenRestAngle,
             maxAngle = newScene.coverOpenRestAngle + 0.06f,
@@ -106,6 +146,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
                 lastTouchY = gesture.y
                 mode = when {
                     tryGrabPage(gesture, width, height) -> TouchMode.PAGE
+                    tryStartRiffle(gesture, width, height) -> TouchMode.RIFFLE
                     hinge != null && isCoverGrab(gesture.x, width, hinge.angle) -> {
                         grabAngle = hinge.angle
                         hinge.grab()
@@ -116,6 +157,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
             }
             is GestureEvent.Move -> when (mode) {
                 TouchMode.PAGE -> dragPage(gesture, width, height)
+                TouchMode.RIFFLE -> trackRiffle(gesture, width, height)
                 TouchMode.COVER -> {
                     val target = grabAngle + (downX - gesture.x) / (width * DRAG_SPAN) * PI.toFloat()
                     hinge?.drag(target)
@@ -140,6 +182,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
                         }
                         scene?.releaseTurn(hint)
                     }
+                    TouchMode.RIFFLE -> rifflePacer.reset()
                     TouchMode.COVER -> {
                         hinge?.release()
                         handleTap(gesture, width)
@@ -155,8 +198,11 @@ class FilamentNotebookRenderer : NotebookRenderer {
     // ------------------------- Page picking / dragging ---------------------
 
     /**
-     * Ray-picks the resting pages; on a hit, starts (or re-grabs) a turn with
-     * the grabbed material point under the finger (docs/03-RENDERER.md §6).
+     * Ray-picks the pages; on a hit, starts a turn (or re-grabs an airborne
+     * page whose paper passes near the pierce point) with the grabbed
+     * material point under the finger (docs/03-RENDERER.md §6). With pages
+     * already in flight a resting-page hit starts ANOTHER flight — real
+     * fast-flipping — until the pool of 3 is full.
      */
     private fun tryGrabPage(gesture: GestureEvent.Down, width: Float, height: Float): Boolean {
         val scene = scene ?: return false
@@ -165,13 +211,16 @@ class FilamentNotebookRenderer : NotebookRenderer {
 
         val dir = raycaster.ray(rig.lastEye, rig.lastCenter, gesture.x, gesture.y, width, height)
 
-        // Re-grab an airborne page: nearest strip particle to the pierce point.
+        // Prefer re-grabbing an airborne page near the pierce point.
         if (scene.isTurning) {
-            val hit = raycaster.hitPlaneY(dir, 0f) ?: return false
-            scene.regrabTurn(scene.worldToSimX(hit.x), scene.worldToSimZ(hit.z))
-            grabPlaneY = 0f
-            resetFlickTracking(gesture.timeMillis, scene.worldToSimX(hit.x))
-            return true
+            raycaster.hitPlaneY(dir, 0f)?.let { hit ->
+                val simX = scene.worldToSimX(hit.x)
+                if (scene.tryRegrab(simX, scene.worldToSimZ(hit.z), maxDist = REGRAB_RADIUS)) {
+                    grabPlaneY = 0f
+                    resetFlickTracking(gesture.timeMillis, simX)
+                    return true
+                }
+            }
         }
 
         // Right page -> forward turn.
@@ -205,12 +254,59 @@ class FilamentNotebookRenderer : NotebookRenderer {
         return (worldY / h + 0.5f).coerceIn(0f, 1f)
     }
 
+    // ------------------------------- Riffle --------------------------------
+
+    /** A touch on the stack's fore-edge strip arms riffle mode (M8). */
+    private fun tryStartRiffle(gesture: GestureEvent.Down, width: Float, height: Float): Boolean {
+        val scene = scene ?: return false
+        val rig = rig ?: return false
+        if (mutableState.value !is BookState.Open && !scene.isTurning) return false
+
+        val dir = raycaster.ray(rig.lastEye, rig.lastCenter, gesture.x, gesture.y, width, height)
+        val hit = raycaster.hitPlaneZ(dir, scene.rightPageWorldZ()) ?: return false
+        if (!scene.riffleZoneContains(hit.x, hit.y)) return false
+
+        rifflePacer.reset()
+        resetFlickTracking(gesture.timeMillis, scene.worldToSimX(hit.x))
+        return true
+    }
+
+    /** Tracks finger speed along the fore-edge; the pacer consumes it per frame. */
+    private fun trackRiffle(gesture: GestureEvent.Move, width: Float, height: Float) {
+        val scene = scene ?: return
+        val rig = rig ?: return
+        val dir = raycaster.ray(rig.lastEye, rig.lastCenter, gesture.x, gesture.y, width, height)
+        val hit = raycaster.hitPlaneZ(dir, scene.rightPageWorldZ()) ?: return
+        val simX = scene.worldToSimX(hit.x)
+        val dtMs = gesture.timeMillis - lastSimTimeMillis
+        if (dtMs > 0) {
+            simVelocityX = (simX - lastSimX) / (dtMs / 1000f)
+            lastSimX = simX
+            lastSimTimeMillis = gesture.timeMillis
+        }
+    }
+
     /** M7 tuning harness hook: live paper feel (docs/05-PHYSICS.md §6). */
     fun setPaperTuning(tuning: PaperTuning) {
         scene?.setPaperTuning(tuning)
     }
 
     fun paperTuning(): PaperTuning? = scene?.paperTuning
+
+    override fun setTextureProvider(provider: TextureProvider?) {
+        textureProvider = provider
+        scene?.setTextureProvider(provider)
+    }
+
+    /** M9: toggle the tilt-driven key sway (docs/04 §3 — optional by design). */
+    fun setKeySwayEnabled(enabled: Boolean) {
+        keySwayEnabled = enabled
+        if (!enabled) {
+            val s = scene ?: return
+            val base = s.keyLightDirection
+            host?.setLightDirection(s.keyLightEntity, base[0], base[1], base[2])
+        }
+    }
 
     private fun dragPage(gesture: GestureEvent.Move, width: Float, height: Float) {
         val scene = scene ?: return
@@ -278,6 +374,14 @@ class FilamentNotebookRenderer : NotebookRenderer {
         val host = host ?: return
         val scene = scene
 
+        // Riffle pump: finger speed feeds the pacer; the pool caps bursts.
+        // Speed decays between move events so a parked finger stops feeding.
+        if (mode == TouchMode.RIFFLE) {
+            simVelocityX *= (1f - (RIFFLE_SPEED_DECAY * dt).coerceAtMost(1f))
+            val pages = rifflePacer.step(dt, abs(simVelocityX))
+            repeat(pages) { scene?.riffleTurn() }
+        }
+
         hinge?.let { h ->
             simAccumulator = (simAccumulator + dt).coerceAtMost(MAX_ACCUMULATED)
             while (simAccumulator >= SIM_DT) {
@@ -287,13 +391,29 @@ class FilamentNotebookRenderer : NotebookRenderer {
             }
             scene?.setCoverAngle(h.angle)
 
-            if (scene != null && scene.isTurning) {
-                scene.updateFlightMesh()
-                if (mode != TouchMode.PAGE && scene.turnSettle() != PageStrip.Settle.IN_FLIGHT) {
-                    scene.completeTurn()
-                }
-            }
+            if (scene != null && scene.isTurning) scene.updateFlightMesh()
+            scene?.streamTextures()
             publishState(h)
+        }
+
+        // Key sway (M9): lean the key light with device tilt.
+        if (keySwayEnabled) {
+            val sway = keySway
+            val s = scene
+            if (sway != null && s != null) {
+                val dir = sway.update(dt)
+                host.setLightDirection(s.keyLightEntity, dir[0], dir[1], dir[2])
+            }
+        }
+
+        // Degradation ladder (M10): sustained vsync misses step quality down;
+        // sustained headroom steps it back up. Physics dt stays fixed.
+        val rung = ladder.feed(dt)
+        if (rung != appliedRung) {
+            appliedRung = rung
+            scene?.applyDegradationRung(rung)
+            host.minFramePeriodNanos =
+                if (rung == DegradationRung.CAPPED_60) CAP_60_PERIOD_NANOS else 0L
         }
 
         rig?.let {
@@ -314,7 +434,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
             scene != null && scene.isTurning -> BookState.Turning(
                 spreadIndex = scene.spread,
                 forward = scene.turnDirectionForward,
-                pagesInFlight = 1,
+                pagesInFlight = scene.pagesInFlight,
             )
             hinge.isSettled && hinge.angle < CLOSED_EPSILON -> BookState.Closed
             hinge.isSettled -> BookState.Open(scene?.spread ?: 0)
@@ -322,7 +442,18 @@ class FilamentNotebookRenderer : NotebookRenderer {
                 (hinge.angle / hinge.openRestAngle).coerceIn(0f, 1f),
             )
         }
-        if (mutableState.value != next) mutableState.value = next
+        val prev = mutableState.value
+        if (prev != next) {
+            // Cover detent moments are physical events too (M8).
+            if (prev is BookState.CoverOpening) {
+                when (next) {
+                    is BookState.Open -> feedback?.on(FeelEvent.COVER_OPEN)
+                    is BookState.Closed -> feedback?.on(FeelEvent.COVER_CLOSE)
+                    else -> Unit
+                }
+            }
+            mutableState.value = next
+        }
     }
 
     private companion object {
@@ -338,5 +469,8 @@ class FilamentNotebookRenderer : NotebookRenderer {
         const val TAP_TIMEOUT_MS = 250L
         const val TAP_SLOP_PX = 24f
         const val FLICK_VELOCITY = 0.35f
+        const val REGRAB_RADIUS = 0.02f
+        const val RIFFLE_SPEED_DECAY = 6f
+        const val CAP_60_PERIOD_NANOS = 1_000_000_000L / 60L
     }
 }

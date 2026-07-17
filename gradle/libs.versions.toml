@@ -1,12 +1,16 @@
 [versions]
-agp = "9.2.1"
+agp = "9.1.1"
 kotlin = "2.4.0"
 ksp = "2.3.10"
 hilt = "2.60.1"
 coroutines = "1.11.0"
 composeBom = "2026.06.01"
 activityCompose = "1.13.0"
+coreKtx = "1.16.0"
 filament = "1.72.0"
+camerax = "1.4.2"
+opencv = "4.11.0"
+room = "2.7.2"
 konsist = "0.17.3"
 junit4 = "4.13.2"
 benchmarkMacro = "1.4.1"
@@ -29,10 +33,22 @@ compose-ui = { module = "androidx.compose.ui:ui" }
 compose-material3 = { module = "androidx.compose.material3:material3" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
 
 # Filament
 filament-android = { module = "com.google.android.filament:filament-android", version.ref = "filament" }
 filament-utils-android = { module = "com.google.android.filament:filament-utils-android", version.ref = "filament" }
+
+# Capture (M12)
+camerax-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "camerax" }
+camerax-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
+camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
+opencv = { module = "org.opencv:opencv", version.ref = "opencv" }
+
+# Storage (M13)
+room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
+room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
 
 # Hilt
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }

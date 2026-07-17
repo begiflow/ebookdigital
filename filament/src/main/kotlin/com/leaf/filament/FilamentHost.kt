@@ -5,6 +5,7 @@ import android.view.Choreographer
 import android.view.Surface
 import android.view.SurfaceView
 import com.google.android.filament.Camera
+import com.google.android.filament.ColorGrading
 import com.google.android.filament.Engine
 import com.google.android.filament.EntityManager
 import com.google.android.filament.Filament
@@ -14,6 +15,7 @@ import com.google.android.filament.Material
 import com.google.android.filament.Renderer
 import com.google.android.filament.Scene
 import com.google.android.filament.SwapChain
+import com.google.android.filament.ToneMapper
 import com.google.android.filament.View
 import com.google.android.filament.Viewport
 import com.google.android.filament.android.DisplayHelper
@@ -36,6 +38,16 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     /** Called every frame before rendering; receives the frame time in nanos. */
     var frameListener: ((frameTimeNanos: Long) -> Unit)? = null
 
+    /**
+     * Frame cap (M10 degradation ladder, docs/02 §7): when > 0, render
+     * submission is skipped until this much time has passed since the last
+     * rendered frame. The frame listener still runs every vsync — physics
+     * keeps its fixed 120 Hz feel; only presentation degrades.
+     */
+    var minFramePeriodNanos: Long = 0L
+
+    private var lastRenderNanos = 0L
+
     val engine: Engine = Engine.create()
     val scene: Scene = engine.createScene()
     val view: View = engine.createView()
@@ -49,6 +61,13 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     private var swapChain: SwapChain? = null
     private var running = false
 
+    // Neutral color pipeline (docs/04-GRAPHICS-PIPELINE.md §5): linear tone
+    // mapping, no grading — scanned paper white must stay paper white. This
+    // is a scanner-fidelity product; punchy ACES defaults would falsify color.
+    private val colorGrading: ColorGrading = ColorGrading.Builder()
+        .toneMapper(ToneMapper.Linear())
+        .build(engine)
+
     private val frameCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!running) return
@@ -59,9 +78,15 @@ class FilamentHost(private val surfaceView: SurfaceView) {
             try {
                 frameListener?.invoke(frameTimeNanos)
                 val sc = swapChain ?: return
+                if (minFramePeriodNanos > 0L &&
+                    frameTimeNanos - lastRenderNanos < minFramePeriodNanos * 9 / 10
+                ) {
+                    return
+                }
                 if (uiHelper.isReadyToRender && renderer.beginFrame(sc, frameTimeNanos)) {
                     renderer.render(view)
                     renderer.endFrame()
+                    lastRenderNanos = frameTimeNanos
                 }
             } finally {
                 Trace.endSection()
@@ -72,6 +97,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     init {
         view.scene = scene
         view.camera = camera
+        view.colorGrading = colorGrading
 
         uiHelper.renderCallback = object : UiHelper.RendererCallback {
             override fun onNativeWindowChanged(surface: Surface) {
@@ -113,6 +139,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
         intensityLux: Float,
         dirX: Float, dirY: Float, dirZ: Float,
         castShadows: Boolean = false,
+        shadowOptions: LightManager.ShadowOptions? = null,
     ): Int {
         val entity = EntityManager.get().create()
         LightManager.Builder(LightManager.Type.DIRECTIONAL)
@@ -120,9 +147,24 @@ class FilamentHost(private val surfaceView: SurfaceView) {
             .intensity(intensityLux)
             .direction(dirX, dirY, dirZ)
             .castShadows(castShadows)
+            .apply { shadowOptions?.let { shadowOptions(it) } }
             .build(engine, entity)
         scene.addEntity(entity)
         return entity
+    }
+
+    /** Removes and destroys a light entity created by [addDirectionalLight]. */
+    fun removeLight(entity: Int) {
+        scene.removeEntity(entity)
+        engine.lightManager.destroy(entity)
+        engine.destroyEntity(entity)
+        EntityManager.get().destroy(entity)
+    }
+
+    /** Re-aims a light created by [addDirectionalLight] (M9 key sway). */
+    fun setLightDirection(entity: Int, x: Float, y: Float, z: Float) {
+        val lm = engine.lightManager
+        lm.setDirection(lm.getInstance(entity), x, y, z)
     }
 
     /**
@@ -160,6 +202,7 @@ class FilamentHost(private val surfaceView: SurfaceView) {
     fun destroy() {
         pause()
         uiHelper.detach()
+        engine.destroyColorGrading(colorGrading)
         engine.destroyRenderer(renderer)
         engine.destroyView(view)
         engine.destroyScene(scene)

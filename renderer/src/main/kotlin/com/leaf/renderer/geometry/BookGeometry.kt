@@ -111,6 +111,75 @@ object BookGeometry {
     }
 
     /**
+     * SPIRAL wire (M11, docs/03 §4): the coil as stacked torus loops along
+     * the book height — static geometry, one mesh. Loop planes are
+     * perpendicular to Y; each ring is centered on the coil axis at
+     * ([spineX], y, [centerZ]).
+     */
+    fun spiralWire(
+        height: Float,
+        coilRadius: Float,
+        wireRadius: Float,
+        spineX: Float,
+        centerZ: Float = 0f,
+        pitch: Float = 0.008f,
+        ringSegments: Int = 12,
+        tubeSegments: Int = 6,
+    ): MeshData {
+        val b = MeshDataBuilder()
+        val loops = maxOf(2, (height * 0.92f / pitch).toInt())
+        val span = (loops - 1) * pitch
+
+        fun pos(cy: Float, phi: Float, psi: Float): Vec3 {
+            val rx = cos(phi)
+            val rz = sin(phi)
+            val n = Vec3(
+                (cos(psi) * rx),
+                sin(psi),
+                (cos(psi) * rz),
+            )
+            return Vec3(
+                spineX + coilRadius * rx + wireRadius * n.x,
+                cy + wireRadius * n.y,
+                centerZ + coilRadius * rz + wireRadius * n.z,
+            )
+        }
+
+        fun quat(phi: Float, psi: Float): FloatArray {
+            val n = Vec3(cos(psi) * cos(phi), sin(psi), cos(psi) * sin(phi))
+            val t = Vec3(-sin(phi), 0f, cos(phi))
+            val bt = n cross t
+            return FloatArray(4).also {
+                TangentFrames.packQuat(t.x, t.y, t.z, bt.x, bt.y, bt.z, n.x, n.y, n.z, it, 0)
+            }
+        }
+
+        val twoPi = (2.0 * PI).toFloat()
+        for (l in 0 until loops) {
+            val cy = -span / 2f + l * pitch
+            for (i in 0 until ringSegments) {
+                val phi0 = twoPi * i / ringSegments
+                val phi1 = twoPi * (i + 1) / ringSegments
+                for (j in 0 until tubeSegments) {
+                    val psi0 = twoPi * j / tubeSegments
+                    val psi1 = twoPi * (j + 1) / tubeSegments
+                    // ψ advances first so the quad faces outward.
+                    b.addQuadFrames(
+                        pos(cy, phi0, psi0), pos(cy, phi0, psi1),
+                        pos(cy, phi1, psi1), pos(cy, phi1, psi0),
+                        quat(phi0, psi0), quat(phi0, psi1),
+                        quat(phi1, psi1), quat(phi1, psi0),
+                        uv00 = WIRE_UV, uv10 = WIRE_UV, uv11 = WIRE_UV, uv01 = WIRE_UV,
+                    )
+                }
+            }
+        }
+        return b.build()
+    }
+
+    private val WIRE_UV = floatArrayOf(0.5f, 0.5f)
+
+    /**
      * SEWN spine: a half-round shell hugging the -X edge, bridging the front
      * and back covers. Profile parameter theta in [0, pi]: theta=0 meets the
      * front cover, theta=pi the back cover, bulging outward (-X).

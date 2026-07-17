@@ -23,6 +23,8 @@ class RestingPage(
     host: FilamentHost,
     materialInstance: MaterialInstance,
     private val facingPositiveZ: Boolean,
+    /** Local bounds covering any shape this page is given (M10 shadows). */
+    bounds: com.google.android.filament.Box,
 ) {
     private val mesh = DynamicMesh(
         host.engine,
@@ -30,6 +32,10 @@ class RestingPage(
         ROWS,
         materialInstance,
         flipWinding = !facingPositiveZ,
+        // The open spread is what the hero shadow of a turning page falls on.
+        castShadows = false,
+        receiveShadows = true,
+        boundingBox = bounds,
     )
 
     val entity: Int get() = mesh.entity
@@ -37,7 +43,9 @@ class RestingPage(
     /**
      * [spineU] texture u at the spine edge (1 for left pages, 0 for right).
      * The bow lifts the sheet near the spine and settles flat by
-     * [bowExtent] of the width.
+     * [bowExtent] of the width. [spineLift] raises the spine edge itself —
+     * GLUED's rest pose, where pages leave the glue line steeply and the
+     * open book keeps a V (docs/03 §4); zero for the other bindings.
      */
     fun setShape(
         originX: Float,
@@ -47,6 +55,7 @@ class RestingPage(
         bowHeight: Float,
         bowExtent: Float = 0.45f,
         spineU: Float,
+        spineLift: Float = 0f,
     ) {
         val uvs = FloatArray(COLS * ROWS * 2)
         var uv = 0
@@ -60,7 +69,12 @@ class RestingPage(
                     val s = c / (COLS - 1f)
                     val x = originX + s * width
 
-                    val (z, dzds) = bow(s, bowHeight, bowExtent)
+                    var (z, dzds) = bow(s, bowHeight, bowExtent)
+                    if (spineLift > 0f && s < bowExtent) {
+                        val f = 1f - s / bowExtent
+                        z += spineLift * f * f
+                        dzds += -2f * spineLift * f / bowExtent
+                    }
                     pos[pi++] = x
                     pos[pi++] = y
                     pos[pi++] = baseZ + if (facingPositiveZ) z else -z

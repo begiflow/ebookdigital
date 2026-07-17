@@ -3,7 +3,9 @@ package com.leaf.renderer.scene
 import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.opengl.Matrix
+import com.google.android.filament.Box
 import com.google.android.filament.EntityManager
+import com.google.android.filament.LightManager
 import com.google.android.filament.MaterialInstance
 import com.google.android.filament.Texture
 import com.google.android.filament.View
@@ -13,9 +15,14 @@ import com.leaf.filament.StaticMesh
 import com.leaf.filament.Textures
 import com.leaf.physics.PageParams
 import com.leaf.physics.PageStrip
+import com.leaf.physics.PivotModel
+import com.leaf.renderer.DegradationRung
+import com.leaf.renderer.FeelEvent
 import com.leaf.renderer.PaperTuning
+import com.leaf.renderer.RenderBinding
 import com.leaf.renderer.RenderBook
 import com.leaf.renderer.RenderGrain
+import com.leaf.renderer.TextureProvider
 import com.leaf.renderer.geometry.BookGeometry
 import com.leaf.renderer.material.PaperGrain
 import kotlin.math.PI
@@ -41,6 +48,18 @@ class BookScene(
 
     val spreadCount: Int get() = book.sheetCount
     val pageHeightMeters: Float get() = pageH
+
+    /** Key light entity + base aim, for the M9 tilt sway (docs/04 §3). */
+    var keyLightEntity: Int = 0
+        private set
+    val keyLightDirection: FloatArray
+        get() = floatArrayOf(KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
+
+    // M10 degradation state: flight-mesh density for NEW grabs; the key
+    // light is rebuilt on rung changes (shadow options are builder-time).
+    private var currentRung = DegradationRung.FULL
+    private var flightCols = FlightPage.DEFAULT_COLS
+    private var flightRows = FlightPage.DEFAULT_ROWS
 
     private val engine = host.engine
     private val transformManager = engine.transformManager
@@ -70,18 +89,41 @@ class BookScene(
     private val pageTextures = HashMap<Int, Texture>()
     private val blankPage: Bitmap by lazy { blankPaper() }
 
-    // ---- Turn-in-flight state (M6) ----
-    private var flight: FlightPage? = null
-    private var strip: PageStrip? = null
-    private var flightInstances = ArrayList<MaterialInstance>(2)
-    private var turnForward = true
-    val isTurning: Boolean get() = flight != null
-    val turnDirectionForward: Boolean get() = turnForward
+    // ---- Streaming (M13, docs/04 §4) ----
+    private var texturePool: PageTexturePool? = null
+    private var planner: ResidencyPlanner? = null
+    private var lastTurnBias = 0
+    private var boundLeftPageIndex: Int? = null
+    private var boundRightPageIndex: Int? = null
 
-    // ---- Corner-skew state (M7, docs/05-PHYSICS.md §4) ----
-    private var grabV = 0.5f
-    private var skewStrength = 0f
-    private var turnRestAngle = 0f
+    // ---- Flight pool (M6 single page -> M8 pool, docs/03-RENDERER.md §3) ----
+    private class TurnFlight(
+        val sheet: Int,
+        val forward: Boolean,
+        val strip: PageStrip,
+        val page: FlightPage,
+        val front: MaterialInstance,
+        val back: MaterialInstance,
+        /** Rest direction of this turn's source side (M7 corner skew). */
+        val restAngle: Float,
+        var grabV: Float,
+        var skewStrength: Float = 0f,
+        var flicked: Boolean = false,
+    )
+
+    private val flights = ArrayList<TurnFlight>(MAX_FLIGHTS)
+
+    /** The flight under the finger; drags apply to it only. */
+    private var active: TurnFlight? = null
+    private var ledger = TurnLedger(book.sheetCount, 0)
+
+    /** Physical feedback hook (M8): host maps events to sound + haptics. */
+    var onFeel: ((FeelEvent) -> Unit)? = null
+
+    val isTurning: Boolean get() = flights.isNotEmpty()
+    val pagesInFlight: Int get() = flights.size
+    val turnDirectionForward: Boolean
+        get() = active?.forward ?: (flights.lastOrNull()?.forward ?: true)
 
     /** Live paper feel; physics params apply from the next grab. */
     var paperTuning: PaperTuning = PaperTuning.fromBook(book)
@@ -96,6 +138,16 @@ class BookScene(
     private val pageH = h * (1f - BLOCK_INSET)
     private val backInnerZ = -halfT + coverT
     private val spineX = -w / 2f
+
+    // Rest pose per binding (docs/03 §4): mild bow for SEWN, near flat for
+    // STAPLED, strong bow + lifted spine edge for GLUED (the V), flat SPIRAL.
+    private val restBow = when (book.binding) {
+        RenderBinding.SEWN -> BOW_HEIGHT
+        RenderBinding.STAPLED -> 0.0015f
+        RenderBinding.GLUED -> 0.005f
+        RenderBinding.SPIRAL -> 0.0008f
+    }
+    private val restSpineLift = if (book.binding == RenderBinding.GLUED) 0.0075f else 0f
 
     /**
      * Cover rest pose: past PI so the opened board slopes down and its free
@@ -114,8 +166,14 @@ class BookScene(
         val plainMaterial = host.loadMaterial(
             assets.open("materials/ribbon.filamat").use { it.readBytes() },
         )
+        // SPIRAL uses the masked variant (punched-hole margin, docs/03 §4).
+        val paperFile = if (book.binding == RenderBinding.SPIRAL) {
+            "materials/paper_masked.filamat"
+        } else {
+            "materials/paper.filamat"
+        }
         paperMaterial = host.loadMaterial(
-            assets.open("materials/paper.filamat").use { it.readBytes() },
+            assets.open(paperFile).use { it.readBytes() },
         )
 
         // ---- Materials ----
@@ -157,6 +215,7 @@ class BookScene(
             srgb = false,
         )
         leftPaperInstance = newPaperInstance(paperMaterial, grainTexture)
+        markMirroredHoles(leftPaperInstance) // left pages: u runs spine->1
         rightPaperInstance = newPaperInstance(paperMaterial, grainTexture)
 
         hingeZ = halfT - coverT / 2f
@@ -168,7 +227,55 @@ class BookScene(
             BookGeometry.panel(w * 0.995f, h * 0.995f, 0f, 0f, backInnerZ + Z_EPS, facingPositiveZ = true),
             endpaperInstance,
         )
-        addStatic(BookGeometry.sewnSpine(h, halfT, -w / 2f), frontInstance)
+
+        // ---- Spine per binding (M11, docs/03 §4) ----
+        when (book.binding) {
+            RenderBinding.SEWN -> addStatic(BookGeometry.sewnSpine(h, halfT, spineX), frontInstance)
+            RenderBinding.STAPLED -> {
+                // Flat spine + two visible staples.
+                addStatic(
+                    BookGeometry.board(0.0015f, h, 2f * halfT * 0.98f, spineX - 0.00075f, 0f, 0f),
+                    frontInstance,
+                )
+                val stapleInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.75f, 0.76f, 0.78f)
+                    setParameter("roughness", 0.35f)
+                }
+                for (sy in floatArrayOf(-h * 0.22f, h * 0.22f)) {
+                    addStatic(
+                        BookGeometry.board(0.0012f, 0.012f, 2f * halfT * 0.55f, spineX - 0.0018f, sy, 0f),
+                        stapleInstance,
+                    )
+                }
+            }
+            RenderBinding.GLUED -> {
+                // Squared glue spine, darker than the cover.
+                val glueInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.38f, 0.33f, 0.27f)
+                    setParameter("roughness", 0.75f)
+                }
+                addStatic(
+                    BookGeometry.board(0.002f, h, 2f * halfT, spineX - 0.001f, 0f, 0f),
+                    glueInstance,
+                )
+            }
+            RenderBinding.SPIRAL -> {
+                // No spine board: the coil is the binding.
+                val wireInstance = plainMaterial.createInstance().apply {
+                    setParameter("baseColor", 0.78f, 0.78f, 0.80f)
+                    setParameter("roughness", 0.32f)
+                }
+                addStatic(
+                    BookGeometry.spiralWire(
+                        height = h,
+                        coilRadius = halfT + 0.002f,
+                        wireRadius = 0.0008f,
+                        spineX = spineX,
+                    ),
+                    wireInstance,
+                )
+            }
+        }
         addStatic(
             BookGeometry.board(DESK_W, DESK_H, 0.002f, 0.05f, 0f, -halfT - 0.0045f),
             deskInstance,
@@ -197,15 +304,19 @@ class BookScene(
         }
 
         // ---- Resting pages (persistent; reshaped per spread) ----
-        rightPage = RestingPage(host, rightPaperInstance, facingPositiveZ = true)
-        leftPage = RestingPage(host, leftPaperInstance, facingPositiveZ = false)
+        // Receiver bounds: generous but book-scale (the hero shadow of a
+        // turning page lands here; casters get the tight box).
+        val spreadBounds = Box(0f, 0f, 0f, w * 1.6f, h, w)
+        rightPage = RestingPage(host, rightPaperInstance, facingPositiveZ = true, bounds = spreadBounds)
+        leftPage = RestingPage(host, leftPaperInstance, facingPositiveZ = false, bounds = spreadBounds)
         transformManager.create(leftPage.entity, coverParentInstance, IDENTITY)
 
         setSpread(0)
         setCoverAngle(0f)
 
         // ---- Light rig ----
-        host.addDirectionalLight(1f, 0.98f, 0.94f, 90_000f, 0.45f, -0.75f, -0.5f, castShadows = true)
+        keyLightEntity = addKeyLight(currentRung)
+        host.view.setShadowType(View.ShadowType.PCF)
         host.setAmbientLight(
             22_000f,
             floatArrayOf(
@@ -226,9 +337,10 @@ class BookScene(
 
     /** Jumps to sheet boundary [k]: k sheets on the left, rest on the right. */
     fun setSpread(k: Int) {
-        abortTurn()
+        abortAllTurns()
         spread = k.coerceIn(0, spreadCount)
-        applySpread()
+        ledger = TurnLedger(spreadCount, spread)
+        refreshRest()
     }
 
     // ================= Turn lifecycle (M6, docs/03-RENDERER.md §3) =========
@@ -238,10 +350,17 @@ class BookScene(
     fun worldToSimZ(worldZ: Float) = worldZ - backInnerZ
 
     /** World z of the right page's pick plane. */
-    fun rightPageWorldZ() = backInnerZ + (spreadCount - spread) * book.sheetThicknessMeters
+    fun rightPageWorldZ() = backInnerZ + ledger.rightCount * book.sheetThicknessMeters
 
     /** World z of the left page's pick plane (at the spine; plane slopes down). */
-    fun leftPageWorldZ() = backInnerZ + leftSpineTopSim(spread)
+    fun leftPageWorldZ() = backInnerZ + leftSpineTopSim(ledger.leftCount)
+
+    /** The stack's fore-edge strip just beyond the right page — the riffle zone. */
+    fun riffleZoneContains(worldX: Float, worldY: Float): Boolean {
+        if (kotlin.math.abs(worldY) > pageH / 2f) return false
+        val edge = spineX + GUTTER + pageW
+        return worldX in edge..(edge + pageW * RIFFLE_ZONE_FRACTION)
+    }
 
     fun pageRectContains(worldX: Float, worldY: Float, rightSide: Boolean): Boolean {
         if (kotlin.math.abs(worldY) > pageH / 2f) return false
@@ -255,22 +374,13 @@ class BookScene(
     /**
      * Starts turning the top sheet of a side. [u] = grab fraction along the
      * width from the spine, [v] = grab fraction along the height (0 = bottom
-     * edge; drives the corner skew). Returns false at the ends of the book.
+     * edge; drives the corner skew). Returns false at the ends of the book or
+     * with [MAX_FLIGHTS] pages already airborne.
      */
-    fun beginTurn(forward: Boolean, u: Float, v: Float = 0.5f): Boolean {
-        if (isTurning) return false
-        if (forward && spread >= spreadCount) return false
-        if (!forward && spread <= 0) return false
-        turnForward = forward
-
-        val sheet = if (forward) spread else spread - 1
-        val sheetT = book.sheetThicknessMeters
-        val rightUnderSheets = if (forward) spreadCount - spread - 1 else spreadCount - spread
-
-        applyTurnVisuals(
-            leftSheets = if (forward) spread else spread - 1,
-            rightSheets = rightUnderSheets,
-        )
+    fun beginTurn(forward: Boolean, u: Float, v: Float = 0.5f, quiet: Boolean = false): Boolean {
+        if (flights.size >= MAX_FLIGHTS) return false
+        val sheet = (if (forward) ledger.grabForward() else ledger.grabBackward()) ?: return false
+        refreshRest()
 
         val s = PageStrip(
             PageParams(
@@ -279,85 +389,244 @@ class BookScene(
                 damping = paperTuning.damping,
                 airDrag = paperTuning.airDrag,
             ),
+            pivotModel(),
         )
-        s.setSurfaces(
-            left = leftSpineTopSim(if (forward) spread else spread - 1),
-            right = rightUnderSheets * sheetT,
-            slopeLeft = leftSlope,
-        )
-        s.resetFlat(onRight = forward, bowHeight = BOW_HEIGHT)
+        // Floors for the whole pool refresh below; resetFlat samples the
+        // surface, so seed this strip's floors first.
+        applySurfaces(s, sheet)
+        s.resetFlat(onRight = forward, bowHeight = restBow)
         s.grab(u)
-        strip = s
-
-        grabV = v.coerceIn(0f, 1f)
-        skewStrength = 0f
-        // Rest direction of the source side: flat right, or down the opened
-        // cover's slope for backward turns.
-        turnRestAngle = if (forward) 0f else atan2(leftSlope, -1f)
 
         // Flight faces: sheet front / back, mapped per the domain sheet model.
         // Each face also carries the *other* side's texture for show-through.
         val frontInstance = newPaperInstance(paperMaterial, grainTexture)
         val backInstance = newPaperInstance(paperMaterial, grainTexture)
+        markMirroredHoles(backInstance) // back-face uvs are u-mirrored
         Textures.bind(frontInstance, "baseColorMap", pageTexture(2 * sheet))
         Textures.bind(frontInstance, "backColorMap", pageTexture(2 * sheet + 1))
         Textures.bind(backInstance, "baseColorMap", pageTexture(2 * sheet + 1))
         Textures.bind(backInstance, "backColorMap", pageTexture(2 * sheet))
-        flightInstances.add(frontInstance)
-        flightInstances.add(backInstance)
 
-        flight = FlightPage(host, frontInstance, backInstance).also {
+        val page = FlightPage(
+            host, frontInstance, backInstance,
+            bounds = flightBounds,
+            cols = flightCols,
+            rows = flightRows,
+        ).also {
             host.scene.addEntity(it.frontEntity)
             host.scene.addEntity(it.backEntity)
             it.update(s, spineX, backInnerZ, pageH)
         }
+        val f = TurnFlight(
+            sheet = sheet,
+            forward = forward,
+            strip = s,
+            page = page,
+            front = frontInstance,
+            back = backInstance,
+            // Rest direction of the source side: flat right, or down the
+            // opened cover's slope for backward turns.
+            restAngle = if (forward) 0f else atan2(leftSlope, -1f),
+            grabV = v.coerceIn(0f, 1f),
+        )
+        flights.add(f)
+        active = f
+        refreshFlightSurfaces()
+        if (!quiet) onFeel?.invoke(FeelEvent.PAGE_GRAB)
         return true
     }
 
-    fun dragTurn(simX: Float, simZ: Float) = strip?.drag(simX, simZ)
+    fun dragTurn(simX: Float, simZ: Float) {
+        active?.strip?.drag(simX, simZ)
+    }
 
-    fun releaseTurn(directionHint: Int) = strip?.release(directionHint)
+    fun releaseTurn(directionHint: Int) {
+        val f = active ?: return
+        f.strip.release(directionHint)
+        f.flicked = directionHint != 0
+        if (f.flicked) onFeel?.invoke(FeelEvent.PAGE_FLICK)
+        active = null
+    }
 
-    /** Re-grab an in-flight page at the particle nearest the touch point. */
-    fun regrabTurn(simX: Float, simZ: Float) {
-        val s = strip ?: return
-        var best = 2
-        var bestSq = Float.MAX_VALUE
-        for (i in 2 until s.n) {
-            val dx = s.px[i] - simX
-            val dz = s.pz[i] - simZ
-            val d = dx * dx + dz * dz
-            if (d < bestSq) { bestSq = d; best = i }
+    /** Re-grabs the nearest in-flight page if its paper passes within [maxDist]. */
+    fun tryRegrab(simX: Float, simZ: Float, maxDist: Float): Boolean {
+        var bestFlight: TurnFlight? = null
+        var bestIndex = 0
+        var bestSq = maxDist * maxDist
+        for (f in flights) {
+            val s = f.strip
+            for (i in MIN_REGRAB_INDEX until s.n) {
+                val dx = s.px[i] - simX
+                val dz = s.pz[i] - simZ
+                val d = dx * dx + dz * dz
+                if (d < bestSq) {
+                    bestSq = d
+                    bestFlight = f
+                    bestIndex = i
+                }
+            }
         }
-        s.grab(best / (s.n - 1f))
+        val f = bestFlight ?: return false
+        f.strip.grab(bestIndex / (f.strip.n - 1f))
+        f.flicked = false
+        active = f
+        onFeel?.invoke(FeelEvent.PAGE_GRAB)
+        return true
+    }
+
+    /** One riffled page: peeled at the fore-edge and flicked left, unheld. */
+    fun riffleTurn(): Boolean {
+        if (!beginTurn(forward = true, u = 0.92f, v = 0.5f, quiet = true)) return false
+        val f = checkNotNull(active)
+        f.strip.fling(speedX = -RIFFLE_KICK_X, lift = RIFFLE_KICK_LIFT)
+        f.strip.release(-1)
+        f.flicked = true
+        active = null
+        onFeel?.invoke(FeelEvent.RIFFLE_TICK)
+        return true
     }
 
     fun stepTurn(dt: Float) {
-        val s = strip ?: return
-        s.step(dt)
-        // Skew ramps in while the finger holds the page and evens out after
-        // release — a settled page must be skew-free before it rejoins a stack.
-        skewStrength = if (s.isGrabbed) {
-            (skewStrength + dt * SKEW_RAMP).coerceAtMost(1f)
-        } else {
-            (skewStrength - dt * SKEW_DECAY).coerceAtLeast(0f)
+        if (flights.isEmpty()) return
+        for (f in flights) {
+            f.strip.step(dt)
+            // Skew ramps in while the finger holds the page and evens out
+            // after release — a page must be skew-free when it rejoins a stack.
+            f.skewStrength = if (f.strip.isGrabbed) {
+                (f.skewStrength + dt * SKEW_RAMP).coerceAtMost(1f)
+            } else {
+                (f.skewStrength - dt * SKEW_DECAY).coerceAtLeast(0f)
+            }
         }
+        retireSettled()
     }
 
-    fun turnSettle(): PageStrip.Settle = strip?.settle ?: PageStrip.Settle.IN_FLIGHT
-
-    /** Extrudes the current strip state into the flight meshes (once/frame). */
+    /** Extrudes every strip's current state into its flight meshes (once/frame). */
     fun updateFlightMesh() {
-        val s = strip ?: return
         // λ(stiffness): how much of the curl the far edge keeps. Card stock
         // (stiffness 1) lifts as a plate — zero skew.
         val lambda = SKEW_LAMBDA_FLOOR + (1f - SKEW_LAMBDA_FLOOR) * paperTuning.stiffness
-        flight?.update(
-            s, spineX, backInnerZ, pageH,
-            grabV = grabV,
-            skew = skewStrength * (1f - lambda),
-            restAngle = turnRestAngle,
+        for (f in flights) {
+            f.page.update(
+                f.strip, spineX, backInnerZ, pageH,
+                grabV = f.grabV,
+                skew = f.skewStrength * (1f - lambda),
+                restAngle = f.restAngle,
+            )
+        }
+    }
+
+    /**
+     * Tight world bounds around anywhere a flight page can deform — what the
+     * directional shadow frustum is fitted to (docs/04 §3).
+     */
+    private val flightBounds: Box
+        get() = Box(
+            spineX, 0f, backInnerZ + pageW * 0.45f,
+            pageW + GUTTER + 0.01f, pageH / 2f + 0.01f, pageW * 0.55f,
         )
+
+    /** Binding-specific root constraint (M11, docs/05 §2 constraint 3). */
+    private fun pivotModel(): PivotModel = when (book.binding) {
+        RenderBinding.SEWN -> PivotModel.Hinge()
+        RenderBinding.STAPLED -> PivotModel.Hinge(rootBendStiffness = 0.5f, foldAngle = 0f)
+        RenderBinding.GLUED -> PivotModel.Hinge(rootBendStiffness = 0.85f, foldAngle = 0.9f)
+        RenderBinding.SPIRAL -> PivotModel.Wire(
+            // Coil axis at the book's mid-plane (world z = 0), reaching past
+            // the block; slack is the punched hole's play on the wire.
+            centerZ = -backInnerZ,
+            radius = halfT + 0.002f,
+            slack = 0.0015f,
+        )
+    }
+
+    private fun addKeyLight(rung: DegradationRung): Int = host.addDirectionalLight(
+        1f, 0.98f, 0.94f, 90_000f,
+        KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z,
+        castShadows = true,
+        shadowOptions = LightManager.ShadowOptions().apply {
+            mapSize = if (rung == DegradationRung.FULL) SHADOW_MAP_FULL else SHADOW_MAP_REDUCED
+            // Bias tuned for a ~0.2 m scene (M10): small enough that the
+            // turning page's shadow stays attached at the spine (contact
+            // hardening), large enough to avoid acne across curl extremes.
+            constantBias = 0.0005f
+            normalBias = 1f
+            shadowFar = 1.5f
+            // Screen-space contact shadows ground the book on the desk and
+            // darken the cover-slightly-open crack (docs/04 §3); first to go.
+            screenSpaceContactShadows = rung == DegradationRung.FULL
+        },
+    )
+
+    /**
+     * Applies a degradation rung (docs/02 §7): shadow resolution, then
+     * flight-mesh density (new grabs), then the host's frame cap — the last
+     * is the renderer's job. Physics never degrades.
+     */
+    fun applyDegradationRung(rung: DegradationRung) {
+        if (rung == currentRung) return
+        currentRung = rung
+        host.removeLight(keyLightEntity)
+        keyLightEntity = addKeyLight(rung)
+        val reducedMesh = rung.ordinal >= DegradationRung.REDUCED_MESH.ordinal
+        flightCols = if (reducedMesh) FlightPage.REDUCED_COLS else FlightPage.DEFAULT_COLS
+        flightRows = if (reducedMesh) FlightPage.REDUCED_ROWS else FlightPage.DEFAULT_ROWS
+    }
+
+    /** Installs (or clears) the streaming pull path (M13, docs/02 §4). */
+    fun setTextureProvider(provider: TextureProvider?) {
+        texturePool?.destroy()
+        if (provider == null) {
+            texturePool = null
+            planner = null
+        } else {
+            texturePool = PageTexturePool(engine, provider)
+            planner = ResidencyPlanner(spreadCount)
+        }
+        refreshRest()
+    }
+
+    /**
+     * Once-per-frame streaming step: plan residency around the current
+     * spread (prefetch biased toward the last turn direction), pump bounded
+     * uploads, and rebind visible surfaces whose texture just arrived.
+     */
+    fun streamTextures() {
+        val pool = texturePool ?: return
+        val plan = planner?.plan(ledger.leftCount, currentBias()) ?: return
+        pool.update(plan)
+        if (pool.updatedPages.isNotEmpty()) rebindVisible(pool.updatedPages)
+    }
+
+    private fun currentBias(): Int {
+        if (flights.isNotEmpty()) {
+            lastTurnBias = if (turnDirectionForward) 1 else -1
+        }
+        return lastTurnBias
+    }
+
+    /** Rebinds any visible face whose page is among [pages]. */
+    private fun rebindVisible(pages: List<Int>) {
+        val left = boundLeftPageIndex
+        if (left != null && (left in pages || (left - 1) in pages)) {
+            Textures.bind(leftPaperInstance, "baseColorMap", pageTexture(left))
+            Textures.bind(leftPaperInstance, "backColorMap", pageTexture(left - 1))
+        }
+        val right = boundRightPageIndex
+        if (right != null && (right in pages || (right + 1) in pages)) {
+            Textures.bind(rightPaperInstance, "baseColorMap", pageTexture(right))
+            Textures.bind(rightPaperInstance, "backColorMap", pageTexture(right + 1))
+        }
+        for (f in flights) {
+            val front = 2 * f.sheet
+            val back = 2 * f.sheet + 1
+            if (front in pages || back in pages) {
+                Textures.bind(f.front, "baseColorMap", pageTexture(front))
+                Textures.bind(f.front, "backColorMap", pageTexture(back))
+                Textures.bind(f.back, "baseColorMap", pageTexture(back))
+                Textures.bind(f.back, "backColorMap", pageTexture(front))
+            }
+        }
     }
 
     /** Applies live paper-feel tuning; physics params take effect on the next grab. */
@@ -366,44 +635,89 @@ class BookScene(
         val show = tuning.translucency
         leftPaperInstance.setParameter("showThrough", show)
         rightPaperInstance.setParameter("showThrough", show)
-        flightInstances.forEach { it.setParameter("showThrough", show) }
+        for (f in flights) {
+            f.front.setParameter("showThrough", show)
+            f.back.setParameter("showThrough", show)
+        }
     }
 
-    /** Ends the turn: advances the spread by where the sheet landed. */
-    fun completeTurn() {
-        val s = strip ?: return
-        val landedLeft = s.settle == PageStrip.Settle.SETTLED_LEFT
-        val next = when {
-            turnForward && landedLeft -> spread + 1
-            !turnForward && !landedLeft -> spread - 1
-            else -> spread
+    /** Settled, unheld flights land; landing may force blockers down too. */
+    private fun retireSettled() {
+        var landedAny = false
+        var scan = true
+        while (scan) {
+            scan = false
+            for (f in flights) {
+                if (f === active || f.strip.settle == PageStrip.Settle.IN_FLIGHT) continue
+                landFlight(f)
+                landedAny = true
+                scan = true
+                break
+            }
         }
-        setSpread(next) // also destroys flight via abortTurn()
+        if (landedAny) {
+            spread = ledger.restingSpread
+            refreshRest()
+            refreshFlightSurfaces()
+        }
     }
 
-    private fun abortTurn() {
-        flight?.let {
-            host.scene.removeEntity(it.frontEntity)
-            host.scene.removeEntity(it.backEntity)
-            it.destroy()
+    private fun landFlight(f: TurnFlight) {
+        val landings = ledger.land(f.sheet, left = f.strip.settle == PageStrip.Settle.SETTLED_LEFT)
+        for ((sheet, _) in landings) {
+            val g = flights.first { it.sheet == sheet }
+            onFeel?.invoke(
+                if (g === f && f.flicked) FeelEvent.PAGE_LAND_FLICK else FeelEvent.PAGE_LAND_SOFT,
+            )
+            retire(g)
         }
-        flight = null
-        strip = null
-        flightInstances.forEach { engine.destroyMaterialInstance(it) }
-        flightInstances.clear()
+    }
+
+    private fun retire(f: TurnFlight) {
+        host.scene.removeEntity(f.page.frontEntity)
+        host.scene.removeEntity(f.page.backEntity)
+        f.page.destroy()
+        engine.destroyMaterialInstance(f.front)
+        engine.destroyMaterialInstance(f.back)
+        flights.remove(f)
+        if (active === f) active = null
+    }
+
+    private fun abortAllTurns() {
+        while (flights.isNotEmpty()) retire(flights[flights.size - 1])
+        active = null
     }
 
     private fun leftSpineTopSim(leftSheets: Int): Float =
         // Opened cover's inner face passes the spine at world halfT; stack on top.
         (halfT - backInnerZ) + leftSheets * book.sheetThicknessMeters
 
-    /** Wedges/resting pages while a sheet is airborne. */
-    private fun applyTurnVisuals(leftSheets: Int, rightSheets: Int) {
+    /**
+     * A strip's collision floors: resting sheets plus any airborne sheets
+     * that will pile beneath it on that side (keeps concurrent flights
+     * stacking in the right order before they land).
+     */
+    private fun applySurfaces(strip: PageStrip, sheet: Int) {
+        strip.setSurfaces(
+            left = leftSpineTopSim(ledger.leftCount + ledger.airborneBelowOnLeft(sheet)),
+            right = (ledger.rightCount + ledger.airborneAboveOnRight(sheet)) * book.sheetThicknessMeters,
+            slopeLeft = leftSlope,
+        )
+    }
+
+    private fun refreshFlightSurfaces() {
+        for (f in flights) applySurfaces(f.strip, f.sheet)
+    }
+
+    /** Wedges + resting pages from the ledger's current resting counts. */
+    private fun refreshRest() {
+        val left = ledger.leftCount
+        val right = ledger.rightCount
         rebuildWedgesAndPages(
-            leftSheets = leftSheets,
-            rightSheets = rightSheets,
-            leftPageIndex = if (leftSheets > 0) 2 * leftSheets - 1 else null,
-            rightPageIndex = if (rightSheets > 0) 2 * (spreadCount - rightSheets) else null,
+            leftSheets = left,
+            rightSheets = right,
+            leftPageIndex = if (left > 0) 2 * left - 1 else null,
+            rightPageIndex = if (right > 0) 2 * (spreadCount - right) else null,
         )
     }
 
@@ -416,7 +730,9 @@ class BookScene(
     }
 
     fun destroy() {
-        abortTurn()
+        texturePool?.destroy()
+        texturePool = null
+        abortAllTurns()
         leftWedge?.destroy(); rightWedge?.destroy()
         leftPage.destroy(); rightPage.destroy()
         staticMeshes.forEach { it.destroy() }
@@ -425,15 +741,6 @@ class BookScene(
         pageTextures.clear()
         engine.destroyEntity(coverRoot)
         entityManager.destroy(coverRoot)
-    }
-
-    private fun applySpread() {
-        rebuildWedgesAndPages(
-            leftSheets = spread,
-            rightSheets = spreadCount - spread,
-            leftPageIndex = if (spread > 0) 2 * spread - 1 else null,
-            rightPageIndex = if (spread < spreadCount) 2 * spread else null,
-        )
     }
 
     private fun rebuildWedgesAndPages(
@@ -477,6 +784,8 @@ class BookScene(
         }
 
         // ---- Resting pages + textures ----
+        boundLeftPageIndex = leftPageIndex
+        boundRightPageIndex = rightPageIndex
         val showLeft = leftPageIndex != null
         if (showLeft) {
             leftPage.setShape(
@@ -484,8 +793,9 @@ class BookScene(
                 width = pageW,
                 height = pageH,
                 baseZ = -coverT / 2f - leftT - Z_EPS,
-                bowHeight = BOW_HEIGHT,
+                bowHeight = restBow,
                 spineU = 1f,
+                spineLift = restSpineLift,
             )
             Textures.bind(leftPaperInstance, "baseColorMap", pageTexture(leftPageIndex!!))
             // Other side of the same sheet, for show-through (docs/04 §2.1).
@@ -503,8 +813,9 @@ class BookScene(
                 width = pageW,
                 height = pageH,
                 baseZ = backInnerZ + rightT + Z_EPS,
-                bowHeight = BOW_HEIGHT,
+                bowHeight = restBow,
                 spineU = 0f,
+                spineLift = restSpineLift,
             )
             Textures.bind(rightPaperInstance, "baseColorMap", pageTexture(rightPageIndex!!))
             Textures.bind(rightPaperInstance, "backColorMap", pageTexture(rightPageIndex + 1))
@@ -515,13 +826,24 @@ class BookScene(
         }
     }
 
-    private fun pageTexture(pageIndex: Int): Texture = pageTextures.getOrPut(pageIndex) {
-        val bitmap = if (pageIndex == BLANK_PAGE_INDEX) {
-            blankPage
-        } else {
-            book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+    private fun pageTexture(pageIndex: Int): Texture {
+        // Streaming path: pool texture when resident, blank until it arrives
+        // (never gray, never the wrong page — docs/04 §4).
+        val pool = texturePool
+        if (pool != null && pageIndex != BLANK_PAGE_INDEX) {
+            pool.texture(pageIndex)?.let { return it }
+            return pageTextures.getOrPut(BLANK_PAGE_INDEX) {
+                Textures.fromBitmap(engine, blankPage)
+            }
         }
-        Textures.fromBitmap(engine, bitmap)
+        return pageTextures.getOrPut(pageIndex) {
+            val bitmap = if (pageIndex == BLANK_PAGE_INDEX) {
+                blankPage
+            } else {
+                book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+            }
+            Textures.fromBitmap(engine, bitmap)
+        }
     }
 
     private fun newPaperInstance(material: com.google.android.filament.Material, grain: Texture) =
@@ -543,10 +865,26 @@ class BookScene(
             setParameter("grainTiling", 5f, 7f)
             setParameter("showThrough", paperTuning.translucency)
             setParameter("keyLightDir", KEY_LIGHT_X, KEY_LIGHT_Y, KEY_LIGHT_Z)
+            setParameter("edgeTint", EDGE_TINT)
+            if (book.binding == RenderBinding.SPIRAL) {
+                // Punched-hole margin (paper_masked.mat). holeU flips to the
+                // mirrored edge for faces whose u runs away from the spine.
+                setParameter("pageSize", pageW, pageH)
+                setParameter("holeCount", HOLE_COUNT)
+                setParameter("holeRadius", HOLE_RADIUS)
+                setParameter("holeU", HOLE_U)
+            }
             Textures.bind(this, "grainNormal", grain)
             // All samplers must be bound; real back textures rebind per page.
             Textures.bind(this, "backColorMap", pageTexture(BLANK_PAGE_INDEX))
         }
+
+    /** Faces whose texture u is mirrored keep their holes at the spine. */
+    private fun markMirroredHoles(instance: MaterialInstance) {
+        if (book.binding == RenderBinding.SPIRAL) {
+            instance.setParameter("holeU", 1f - HOLE_U)
+        }
+    }
 
     private fun addStatic(
         data: MeshData,
@@ -573,6 +911,11 @@ class BookScene(
         const val BOARD_COLOR = 0xFF6D4A2F.toInt()
         const val Z_EPS = 0.00015f
         const val DESK_GAP = 0.0045f
+
+        // SPIRAL punched holes (M11): margin column in u, sizes in meters.
+        const val HOLE_U = 0.05f
+        const val HOLE_COUNT = 9f
+        const val HOLE_RADIUS = 0.0028f
         const val DESK_W = 0.85f
         const val DESK_H = 1.2f
         val IDENTITY = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
@@ -582,6 +925,20 @@ class BookScene(
         const val SKEW_RAMP = 9f
         const val SKEW_DECAY = 4.5f
         const val SKEW_LAMBDA_FLOOR = 0.35f
+
+        // Edge tint (M9, docs/04 §2.1): handled-paper darkening at borders.
+        const val EDGE_TINT = 0.055f
+
+        // Shadow map sizes per degradation rung (M10).
+        const val SHADOW_MAP_FULL = 2048
+        const val SHADOW_MAP_REDUCED = 1024
+
+        // Flight pool + riffle (M8).
+        const val MAX_FLIGHTS = 3
+        const val MIN_REGRAB_INDEX = 2
+        const val RIFFLE_KICK_X = 1.4f
+        const val RIFFLE_KICK_LIFT = 0.55f
+        const val RIFFLE_ZONE_FRACTION = 0.16f
 
         // Must match the addDirectionalLight() rig below (normalized).
         val KEY_LIGHT_LEN = sqrt(0.45f * 0.45f + 0.75f * 0.75f + 0.5f * 0.5f)
