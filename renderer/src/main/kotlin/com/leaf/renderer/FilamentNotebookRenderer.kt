@@ -34,6 +34,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
     private var hinge: CoverHinge? = null
     private var loadedBook: RenderBook? = null
     private var feedback: FeelFeedback? = null
+    private var textureProvider: TextureProvider? = null
 
     private val raycaster = Raycaster(FilamentHost.VERTICAL_FOV_DEGREES.toFloat())
     private val rifflePacer = RifflePacer()
@@ -111,6 +112,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
         scene?.destroy()
         val newScene = BookScene(host, book, assets)
         newScene.onFeel = { event -> feedback?.on(event) }
+        newScene.setTextureProvider(textureProvider)
         scene = newScene
         keySway = newScene.keyLightDirection.let { KeySway(it[0], it[1], it[2]) }
         hinge = CoverHinge(
@@ -291,6 +293,11 @@ class FilamentNotebookRenderer : NotebookRenderer {
 
     fun paperTuning(): PaperTuning? = scene?.paperTuning
 
+    override fun setTextureProvider(provider: TextureProvider?) {
+        textureProvider = provider
+        scene?.setTextureProvider(provider)
+    }
+
     /** M9: toggle the tilt-driven key sway (docs/04 §3 — optional by design). */
     fun setKeySwayEnabled(enabled: Boolean) {
         keySwayEnabled = enabled
@@ -385,6 +392,7 @@ class FilamentNotebookRenderer : NotebookRenderer {
             scene?.setCoverAngle(h.angle)
 
             if (scene != null && scene.isTurning) scene.updateFlightMesh()
+            scene?.streamTextures()
             publishState(h)
         }
 

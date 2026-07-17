@@ -22,6 +22,7 @@ import com.leaf.renderer.PaperTuning
 import com.leaf.renderer.RenderBinding
 import com.leaf.renderer.RenderBook
 import com.leaf.renderer.RenderGrain
+import com.leaf.renderer.TextureProvider
 import com.leaf.renderer.geometry.BookGeometry
 import com.leaf.renderer.material.PaperGrain
 import kotlin.math.PI
@@ -87,6 +88,13 @@ class BookScene(
 
     private val pageTextures = HashMap<Int, Texture>()
     private val blankPage: Bitmap by lazy { blankPaper() }
+
+    // ---- Streaming (M13, docs/04 §4) ----
+    private var texturePool: PageTexturePool? = null
+    private var planner: ResidencyPlanner? = null
+    private var lastTurnBias = 0
+    private var boundLeftPageIndex: Int? = null
+    private var boundRightPageIndex: Int? = null
 
     // ---- Flight pool (M6 single page -> M8 pool, docs/03-RENDERER.md §3) ----
     private class TurnFlight(
@@ -565,6 +573,62 @@ class BookScene(
         flightRows = if (reducedMesh) FlightPage.REDUCED_ROWS else FlightPage.DEFAULT_ROWS
     }
 
+    /** Installs (or clears) the streaming pull path (M13, docs/02 §4). */
+    fun setTextureProvider(provider: TextureProvider?) {
+        texturePool?.destroy()
+        if (provider == null) {
+            texturePool = null
+            planner = null
+        } else {
+            texturePool = PageTexturePool(engine, provider)
+            planner = ResidencyPlanner(spreadCount)
+        }
+        refreshRest()
+    }
+
+    /**
+     * Once-per-frame streaming step: plan residency around the current
+     * spread (prefetch biased toward the last turn direction), pump bounded
+     * uploads, and rebind visible surfaces whose texture just arrived.
+     */
+    fun streamTextures() {
+        val pool = texturePool ?: return
+        val plan = planner?.plan(ledger.leftCount, currentBias()) ?: return
+        pool.update(plan)
+        if (pool.updatedPages.isNotEmpty()) rebindVisible(pool.updatedPages)
+    }
+
+    private fun currentBias(): Int {
+        if (flights.isNotEmpty()) {
+            lastTurnBias = if (turnDirectionForward) 1 else -1
+        }
+        return lastTurnBias
+    }
+
+    /** Rebinds any visible face whose page is among [pages]. */
+    private fun rebindVisible(pages: List<Int>) {
+        val left = boundLeftPageIndex
+        if (left != null && (left in pages || (left - 1) in pages)) {
+            Textures.bind(leftPaperInstance, "baseColorMap", pageTexture(left))
+            Textures.bind(leftPaperInstance, "backColorMap", pageTexture(left - 1))
+        }
+        val right = boundRightPageIndex
+        if (right != null && (right in pages || (right + 1) in pages)) {
+            Textures.bind(rightPaperInstance, "baseColorMap", pageTexture(right))
+            Textures.bind(rightPaperInstance, "backColorMap", pageTexture(right + 1))
+        }
+        for (f in flights) {
+            val front = 2 * f.sheet
+            val back = 2 * f.sheet + 1
+            if (front in pages || back in pages) {
+                Textures.bind(f.front, "baseColorMap", pageTexture(front))
+                Textures.bind(f.front, "backColorMap", pageTexture(back))
+                Textures.bind(f.back, "baseColorMap", pageTexture(back))
+                Textures.bind(f.back, "backColorMap", pageTexture(front))
+            }
+        }
+    }
+
     /** Applies live paper-feel tuning; physics params take effect on the next grab. */
     fun setPaperTuning(tuning: PaperTuning) {
         paperTuning = tuning
@@ -666,6 +730,8 @@ class BookScene(
     }
 
     fun destroy() {
+        texturePool?.destroy()
+        texturePool = null
         abortAllTurns()
         leftWedge?.destroy(); rightWedge?.destroy()
         leftPage.destroy(); rightPage.destroy()
@@ -718,6 +784,8 @@ class BookScene(
         }
 
         // ---- Resting pages + textures ----
+        boundLeftPageIndex = leftPageIndex
+        boundRightPageIndex = rightPageIndex
         val showLeft = leftPageIndex != null
         if (showLeft) {
             leftPage.setShape(
@@ -758,13 +826,24 @@ class BookScene(
         }
     }
 
-    private fun pageTexture(pageIndex: Int): Texture = pageTextures.getOrPut(pageIndex) {
-        val bitmap = if (pageIndex == BLANK_PAGE_INDEX) {
-            blankPage
-        } else {
-            book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+    private fun pageTexture(pageIndex: Int): Texture {
+        // Streaming path: pool texture when resident, blank until it arrives
+        // (never gray, never the wrong page — docs/04 §4).
+        val pool = texturePool
+        if (pool != null && pageIndex != BLANK_PAGE_INDEX) {
+            pool.texture(pageIndex)?.let { return it }
+            return pageTextures.getOrPut(BLANK_PAGE_INDEX) {
+                Textures.fromBitmap(engine, blankPage)
+            }
         }
-        Textures.fromBitmap(engine, bitmap)
+        return pageTextures.getOrPut(pageIndex) {
+            val bitmap = if (pageIndex == BLANK_PAGE_INDEX) {
+                blankPage
+            } else {
+                book.pageBitmapProvider?.invoke(pageIndex) ?: blankPage
+            }
+            Textures.fromBitmap(engine, bitmap)
+        }
     }
 
     private fun newPaperInstance(material: com.google.android.filament.Material, grain: Texture) =
